@@ -1,0 +1,246 @@
+<?php
+function jstor_fees_helper_menu() {
+    $items['feespage'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'page arguments' => array(null,null),
+      'title'=> 'Fees & Classification'
+    );
+    
+    $items['feespage/%/%'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'title'=> 'Fees & Classification',
+      'page arguments' => array(0,1,2),
+      'type' => MENU_CALLBACK,
+    );
+    /*
+    $items['fees-classification'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'page arguments' => array(null,null),
+      'title'=> 'Fees & Classification'
+    );
+    */
+    $items['chart-description/%'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'title'=> 'Fees & Classification',
+      'page arguments' => array(0,1),
+      'type' => MENU_CALLBACK,
+    );
+    $items['chart-classification/%'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'title'=> 'Fees & Classification',
+      'page arguments' => array(0,1),
+      'type' => MENU_CALLBACK,
+    );
+    $items['chart-fees/%'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'title'=> 'Fees & Classification',
+      'page arguments' => array(0,1),
+      'type' => MENU_CALLBACK,
+    );
+    $items['fees-chart/%'] = array(
+      'page callback' => '_jstor_fees_helper_fees',
+      'access callback' => true,
+      'title'=> 'Fees & Classification',
+      'page arguments' => array(0,1),
+      'type' => MENU_CALLBACK,
+    );      
+    $items['fee_description/%/%'] = array(
+                //'access arguments' => array('access content'),
+                'page callback' => 'jstor_fees_helper_ajax_callback',
+                'access callback' => true,
+                'page arguments' => array(0,1,2),
+                'type' => MENU_CALLBACK,
+     );
+    $items['fee_classification/%/%'] = array(
+                //'access arguments' => array('access content'),
+                'page callback' => 'jstor_fees_helper_ajax_callback',
+                'access callback' => true,
+                'page arguments' => array(0,1,2),
+                'type' => MENU_CALLBACK,
+     );
+    $items['fee_fees/%/%'] = array(
+                //'access arguments' => array('access content'),
+                'page callback' => 'jstor_fees_helper_ajax_callback',
+                'access callback' => true,
+                'page arguments' => array(0,1,2),
+                'type' => MENU_CALLBACK,
+    );
+    $items['fedu/%/%'] = array(
+               // 'access arguments' => array('access content'),
+                'page callback' => 'jstor_fees_helper_ajax_callback',
+                'access callback' => true,
+                'page arguments' => array(0,1,2),
+                'type' => MENU_CALLBACK,
+    );
+    return $items;
+}
+
+function jstor_fees_helper_ajax_callback($page,$js, $id) {
+
+  
+  if($page == 'fedu'){
+    $fc = entity_load('field_collection_item', array($id));
+   $html = $fc[$id]->field_subsection_content['und'][0]['value'];
+  }else{
+     $view = views_get_view('fees');
+     $view->set_display($page);
+     $view->set_arguments(array($id));
+     $html = render($build);
+     $html = $view->render();
+  }
+ 
+  $commands = array();
+  $commands[] = ajax_command_html('#jstor_fees_helper-ajax-wrapper', $html);
+  // Render the commands into JSON and print them.
+  print ajax_render($commands);
+  exit;  // Exit so Drupal doesn't have a chance to build a whole page.
+}
+
+
+function jstor_fees_helper_charts($urlparam){
+  
+  $value = '';
+  switch ($urlparam) {
+    case 'chart-description':
+      $value = 'fee_description';
+      break;
+    case 'chart-fees':
+      $value = 'fee_fees';
+      break;
+    case 'chart-classification':
+      $value = 'fee_classification';
+      break;
+    case 'fees-chart':
+      $value = 'fedu';
+      break;
+    default:
+      $value = null;
+      break;
+  }
+  return $value;
+}
+
+function jstor_fees_helper_institution($urlparam){
+  $institution = explode('_', $urlparam);
+  $value = '';
+  switch ($institution[0]) {
+    //**FEDU***********
+    case 'universities-four-year-colleges':
+      if(!isset($institution[1])){
+        $value = '184308';
+      }else{
+        $value = jstor_fees_helper_fedu($institution[0], $institution[1]);
+      }     
+      break;
+    case 'uk-universities-four-year-colleges':
+      $value = '132747';
+      break;
+    case 'international-universities-four-year-colleges':
+      $value = '184309';
+      break;
+    case 'community-colleges':
+      $value = '132746';
+      break;
+    case 'for-profit-academic-institutions':
+      $value = '132749';
+      break;
+    case 'corp-for-profit-research':
+      $value = '72685';
+      break;
+    case 'secondary-schools':
+      $value = '72669';
+      break;
+    //**FEDU***********
+    case 'government-non-profit-research':
+      if(!isset($institution[1])){
+        $value = '127938';
+      }else{
+        $value = jstor_fees_helper_fedu($institution[0], $institution[1]);
+      }  
+      break;
+    case 'museums':
+      $value = '1';
+      break;
+    case 'public-libraries':
+      $value = '72682';
+      break;
+    //**FEDU***********
+    case 'african-access-initiative':
+      $value = '72683';
+      break;
+    //**FEDU***********
+    case 'developing-nations-access-initiative':
+      if(!isset($institution[1])){
+        $value = '72684';
+      }else{
+        $value = jstor_fees_helper_fedu($institution[0], $institution[1]);
+      } 
+      break;
+    default:
+      $value = null;
+      break;
+  }
+  return $value;
+}
+
+function jstor_fees_helper_fedu($institution, $institution_size){
+  $institution_fields = array(
+    'universities-four-year-colleges' => array(
+      'vsmall' => '1369',
+      'small'  => '1370',
+      'medium' => '1371',
+      'large'  => '1372',
+      'vlarge' => '1373',
+    ),
+    
+    'government-non-profit-research' => array(
+      'vsmall' => '1363',
+      'small'  => '1364',
+      'medium' => '1365',
+      'large'  => '1366',
+      'vlarge' => '1367',
+    ),
+
+    'developing-nations-access-initiative' => array(
+      'tier1' => '1360',
+      'tier2'  => '1361',
+      'tier3' => '1362',
+    ),
+  );
+  return $institution_fields[$institution][$institution_size];
+}
+
+function _jstor_fees_helper_fees($chart = null, $inst = null){
+  if(!is_null($chart)  && !is_null($inst)){
+    $_SESSION['c'] = jstor_fees_helper_charts($chart);
+    $_SESSION['l'] = jstor_fees_helper_institution($inst);
+  }else{
+   return "";
+  }
+  return "";
+}
+
+function jstor_fees_helper_views_post_execute(&$view){
+  
+  if($view->name == 'agreements_riders'){
+     $view->vars['riders_header']  = variable_get('riders_header', 'sup');  
+     $view->vars['agreements_header']  = variable_get('agreements_header', 'sup'); 
+  }
+
+  if($view->current_display == 'block_1' && $view->name == 'fees'){  
+    foreach($view->result as $k => $v){
+      if($v->node_title == 'U.S. Universities and Four-Year Colleges' || $v->node_title == 'Government & Non-Profit Research Institutions' 
+         || $v->node_title  == 'African Access Initiative' || $v->node_title == 'Developing Nations Access Initiative'){
+        $node = node_load($v->nid);
+        unset($view->result[$k]->field_field_classifications);
+        unset($view->result[$k]->field_field_fees);
+      }
+    }
+  }
+}

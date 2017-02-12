@@ -1,0 +1,725 @@
+<?php
+
+function sugarcrm_bridge_webform_mapping_menu() {
+
+  $items['clear-sugar-fields-cache'] = array(
+    'page callback' => 'sugarcrm_bridge_webform_mapping_clear_sugar_fields_cache',
+    'access callback' => 'user_is_logged_in',
+    'title' => 'Clear Sugar Fields Cache',
+    'type' => MENU_CALLBACK,
+  );
+  return $items;
+}
+
+function sugarcrm_bridge_webform_mapping_clear_sugar_fields_cache(){
+
+  db_delete('sugar_mapping_settings')
+    ->condition('name', 'module_field_data')
+    ->execute();
+  sugarcrm_bridge_webform_mapping_get_module_fields();
+  drupal_set_message('sugar module field cache rebuilt');
+  drupal_goto('admin/config/services/sugarcrm-bridge');
+}
+
+
+function sugarcrm_bridge_webform_mapping_get_module_fields() {
+
+  $cached_field_data = sugar_mapping_get_config('module_field_data');
+  if (!empty($cached_field_data) && is_array($cached_field_data)) {
+    return $cached_field_data;
+  }
+  $url = variable_get('sugar_url', '');
+  $url = str_replace('rest/v10/', 'service/v4_1/rest.php', $url);
+  $username = variable_get('sugar_username', '');
+  $password = variable_get('sugar_password', '');
+
+  $login_parameters = array(
+    "user_auth" => array(
+      "user_name" => $username,
+      "password" => md5($password),
+      "version" => "1"
+    ),
+    "application_name" => "ITHAKA",
+    "name_value_list" => array(),
+  );
+
+  $login_result = sugar_call_old_rest("login", $login_parameters, $url);
+
+  //get session id
+  $session_id = $login_result->id;
+
+  //retrieve fields --------------------------------
+  $get_module_fields_parameters = array(
+    'session' => $session_id,
+    //Optional. Returns vardefs for the specified fields. An empty array will return all fields.
+    'fields' => array(),
+  );
+  $get_available_modules = sugar_call_old_rest("get_available_modules", $get_module_fields_parameters, $url);
+  $modulefields = array();
+
+
+  foreach ($get_available_modules->modules as $m) {
+
+    if (!ctype_upper(substr($m->module_key, 0, 1))) {
+      continue;
+    }
+    $get_module_fields_parameters = array(
+      'session' => $session_id,
+      'module_name' => $m->module_key,
+      'fields' => array(),
+    );
+
+    //  $get_module_fields_parameters['module_name'] = $m->module_key;
+    $get_module_fields_result = sugar_call_old_rest("get_module_fields", $get_module_fields_parameters, $url);
+    if (!empty($get_module_fields_result->name) && $get_module_fields_result->name == 'Module Does Not Exist') {
+      continue;
+    }
+    $fields = array();
+    $fields['none'] = '--none--';
+    $fields['name'] = 'Name (name)';
+    $fields['file_attachment'] = 'File Attachment';
+    if (isset($get_module_fields_result->module_fields)) {
+      foreach ($get_module_fields_result->module_fields as $k => $v) {
+        $fields[$k] = sprintf("%s (%s)", $v->label, $k);
+      }
+
+      asort($fields);
+      $modulefields[$get_module_fields_result->module_name] = $fields;
+    }
+    else {
+      watchdog('sugar module cache', 'error resetting module cache');
+    }
+
+
+  }
+  sugar_mapping_set_config('module_field_data', $modulefields);
+ // cache_set('module_field_data', $modulefields, 'cache', CACHE_PERMANENT);
+  return $modulefields;
+
+
+}
+
+function sugarcrm_bridge_webform_mapping_cache_dropdowns() {
+  #future home of caching ISO Dropdowns such as country lists
+}
+
+function sugarcrm_bridge_webform_mapping_form_alter(&$form, &$form_state, $form_id) {
+
+
+  if($form_id == 'sugarcrm_bridge_form'){
+    $form['reset_fields'] = array(
+    '#markup' => '<h3>' .l('Reset Form Mapper\'s Sugar Fields List (can take several minutes)', 'clear-sugar-fields-cache') . '</h3>',
+      '#weight' => 22,
+      '#description' => 'Refreshes the list of available modules and fields available to the Sugar Form Mapper. This can take several minutes.'
+    );
+  }
+
+  if($form_id == 'webform_component_edit_form' && $form['type']['#value'] == 'hidden'){
+    $msg = '<div style="background-color:#E7EFF0;border:1px solid #C5C5C5; padding:8px;margin-bottom:12px; "><h5>To use the value of other form elements in the default value, put the cursor in the "Default Value" field and click the token(s) you want included.</h5><ul>';
+    foreach($form['#node']->webform['components'] as $k => $v){
+      $msg .= sprintf('<li class="token-click-insert"><b>%s:</b> <a class="token-key">{{%s}}</a></li>', $v['name'], $k);
+    }
+    $msg .= '</ul></div>';
+    $form['value']['#suffix'] = $msg;
+  }
+
+  if (strpos($form_id, 'webform_client_form') !== FALSE) {
+    $nid = isset($form['#node']->nid) ? $form['#node']->nid : "";
+    if ($nid) {
+      $sugarmapped_forms = variable_get('sugarmapped_forms', array());
+      if (array_key_exists($nid, $sugarmapped_forms)) {
+        $form['#submit'][] = 'sugarcrm_bridge_webform_mapping_client_submit';
+      }
+    }
+  }
+
+  if ($form_id == 'webform_components_form') {
+    $teams = sugar_get_teams_list();
+    $modulefields = sugarcrm_bridge_webform_mapping_get_module_fields();
+    $modules = array_keys($modulefields);
+
+    //Below is some temp code to remove some modules to speed up loading time - but all modules can easily be made available
+
+    $include_these = array("Calls", "Tasks", "Notes", "Leads", "Contacts", "Accounts", "Opportunties", "Campaigns", "Prospects", "ProspectLists", "Quotes", "Products", "Forecasts", "Contracts", "Documents", "Cases", "ITH_Roles","ITH_Analytics");
+    $tempmodules = array();
+    foreach($modules as $m){
+      if(in_array($m, $include_these)){
+        array_push($tempmodules, $m);
+      }else{
+        unset($modulefields[$m]);
+      }
+    }
+    $modules = $tempmodules;
+
+
+
+    //End temp code
+
+
+    $module_options = array_combine($modules, $modules);
+    $module_options['none'] = '--None--';
+    $nid = isset($form['nid']['#value']) ? $form['nid']['#value'] : "";
+    $existing_config = sugar_mapping_get_config($nid);
+
+    /*
+     * load times seem to be addressed, so show_mapping is defaulting to true to make things less confusing.
+     * If load time for form settings is too long, uncomment the line below and comment $show_mapping = true;
+     * Also, on $form['show_sugar_mappings'] , remove the #access setting, and make #default_value $show_mapping
+     */
+    // $show_mapping = isset($existing_config['show_sugar_mappings']) && $existing_config['show_sugar_mappings'] == 1 ? 1 : 0;
+    $show_mapping = true;
+    $create_email = isset($existing_config['create_email']) && $existing_config['create_email'] == 1 ? 1 : 0;
+
+
+    $form['mapping_label'] = array(
+      '#markup' => "<h1>Map Fields To Sugarcrm</h1>",
+      '#weight' => 0,
+    );
+    $form['map_to_sugar'] = array(
+
+      '#type' =>
+        'checkbox',
+
+      '#title' => t('Map this form to SugarCRM.'),
+      '#weight' => 3,
+      '#default_value' => isset($existing_config['map_to_sugar']) && $existing_config['map_to_sugar'] == 1 ? 1 : 0,
+      '#description' => t('Checking this will disable any existing SugarCRM submit handlers and use the mapping below. You can edit and save mapping settings
+      without them being active by leaving this option unchecked.'),
+    );
+
+
+	  drupal_add_css('.case-settings .form-item {
+	                    background-color:#fff;
+                        border: 1px solid #ccc;
+					    padding: 12px 16px;
+					    position: relative;
+					    margin: 1em 0;;}', 'inline');
+    $form['assign_to_team'] = array(
+      '#type' => 'select',
+      '#title' => t('Assign To Team'),
+      '#options' => $teams,
+      '#default_value' => isset($existing_config['assign_to_team']) && $existing_config['assign_to_team'] ? $existing_config['assign_to_team'] : 'none',
+      '#weight' => 4,
+      '#prefix' => t('<div class="case-settings" style="padding:0 15px;background-color: #EEE;border:1px solid #C5C5C5;"><p> These settings only apply if the form submission creates a case in SugarCRM </p>'),
+      '#attributes' => array('style' => 'background-color:#fff'),
+
+    );
+
+    $form['create_email'] = array(
+
+      '#type' => 'checkbox',
+      '#title' => t('Create incoming email with case'),
+      '#description' => t('If form creates case, it will also appear as an incoming email that can easily be replied to'),
+      '#weight' => 6,
+      '#default_value' => $create_email,
+      '#suffix' => '</div>'
+    );
+
+    $form['show_sugar_mappings'] = array(
+
+        '#type' =>
+            'checkbox',
+
+        '#title' => t('Show Sugar Field Mappings'),
+        '#description' => t('This setting toggles visbility of the Sugar Mapping fields.'),
+        '#weight' => 8,
+        '#default_value' => true,
+        '#access' => false,
+    );
+
+    if ($show_mapping) {
+      $form['sugarmap'] = array(
+        '#type' => 'fieldset',
+        '#title' => t("Assign Drupal form fields to Sugar fields"),
+        '#weight' => 10,
+        '#states' => array(
+          'visible' => array(
+            ':input[name="show_sugar_mappings"]' => array('checked' => TRUE),
+          ),
+        ),
+        '#attributes' => array('style' => 'background-color:#EEE;'),
+        '#description' => 'Mapping is not active unless the "Map this form to SugarCRM" option is checked.<br/>
+                            If there are new SugarCRM fields not listed here, you may need to click this link --> ' .
+                            l('Reset Sugar Fields List (will take several minutes)', 'clear-sugar-fields-cache'),
+      );
+
+      foreach ($form['#node']->webform['components'] as $k => $v) {
+        if ($v['type'] == 'markup') {
+          continue;
+        }
+
+        $form['sugarmap']['sugar-' . $k] = array(
+          '#type' => 'fieldset',
+          '#title' => "Drupal form field: <i>" . $v['name'] . "</i>",
+        );
+
+        $form['sugarmap']['sugar-' . $k]['sugar_module'] = array(
+          '#type' => 'select',
+          '#title' => t('Sugar Module'),
+          '#options' => $module_options,
+          '#default_value' => isset($existing_config['relationships'][$k]) ? $existing_config['relationships'][$k]['module'] : 'none',
+          '#attributes' => array(
+            'style' => array(
+              'width:90%;',
+            ),
+          ),
+          '#prefix' => '<div style="width:20%;float:left;">',
+          '#suffix' => '</div>',
+        );
+
+        foreach ($modules as $m) {
+          $form['sugarmap']['sugar-' . $k][$m] = array(
+            '#type' => 'select',
+            '#title' => t('Sugar Field'),
+            '#options' => $modulefields[$m],
+            '#states' => array(
+              'visible' => array(
+                ':input[name="sugarmap[sugar-' . $k . '][sugar_module]"]' => array('value' => $m),
+              ),
+            ),
+            '#default_value' => isset($existing_config['relationships'][$k]) ? $existing_config['relationships'][$k]['field'] : 'none',
+            '#attributes' => array(
+              'style' => array(
+                'width:90%;',
+              ),
+            ),
+            '#prefix' => '<div style="width:30%;float:left;">',
+            '#suffix' => '</div>',
+          );
+        }
+      }
+    }
+
+    $form['#submit'][] = 'sugar_webform_mapping_extra_submit';
+  }
+
+}
+
+
+function sugar_webform_mapping_extra_submit($form, &$form_state, $decouple_vars = NULL) {
+
+  /*
+   * Save mapping settings
+   */
+  $mapping = array();
+  $mapping['show_sugar_mappings'] = isset($form_state['values']['show_sugar_mappings']) ? $form_state['values']['show_sugar_mappings'] : 0;
+  $mapping['assign_to_team'] = isset($form_state['values']['assign_to_team']) ? $form_state['values']['assign_to_team'] : 0;
+  $mapping['create_email'] = isset($form_state['values']['create_email']) ? $form_state['values']['create_email'] : "";
+
+  if (isset($form['#form_id']) && $form['#form_id'] == 'webform_components_form') {
+    $sugarmapped_forms = variable_get('sugarmapped_forms', array());
+
+    /*
+     * Add or remove from the list of forms mapped to Sugar
+     */
+    if (!empty($form_state['values']['map_to_sugar']) && $form_state['values']['map_to_sugar'] == 1) {
+      $sugarmapped_forms[$form['nid']['#value']] = $form['nid']['#value'];
+      $mapping['map_to_sugar'] = 1;
+    }
+    else {
+      if ( !empty($sugarmapped_forms[$form['nid']['#value']]) && is_null(key($sugarmapped_forms[$form['nid']['#value']]))) {
+        unset($sugarmapped_forms[$form['nid']['#value']]);
+      }
+    }
+    variable_set('sugarmapped_forms', array_unique($sugarmapped_forms));
+     /*
+      * End Add or remove from the list of forms mapped to Sugar
+      */
+
+    if (!empty($form_state['values']['sugarmap'])) {
+      foreach ($form_state['values']['sugarmap'] as $k => $v) {
+
+        //Skip non-mapping portions of array
+        if (substr($k, 0, 5) != 'sugar' || $v['sugar_module'] == 'none') {
+          continue;
+        }
+        //Get node ID of FORM
+        $form_key = substr($k, strpos($k, "-") + 1);
+
+
+        //Determine if it is a multiselect field - different logic
+        $multi = isset ($form['#node']->webform['components'][$form_key]['extra']['multiple']) && $form['#node']->webform['components'][$form_key]['extra']['multiple'] == 1 ? '_multi' : '';
+        $mapping['relationships'][$form_key] = array(
+          'type' => $form['#node']->webform['components'][$form_key]['type'] . $multi,
+          'module' => $v['sugar_module'],
+          'field' => $v[$v['sugar_module']],
+          'label' => $form['#node']->webform['components'][$form_key]['name'],
+        );
+      }
+    }
+
+    if (!empty($mapping)) {
+      $mapping['show_settings'] = $form_state['values']['show_sugar_mappings'];
+      sugar_mapping_set_config($form['nid']['#value'], $mapping);
+    }
+
+  }
+
+
+}
+
+/*
+ * Make calls to earlier versions of Sugar API, which provide a field list
+ */
+function sugar_call_old_rest($method, $parameters, $url) {
+  ob_start();
+  $curl_request = curl_init();
+
+  curl_setopt($curl_request, CURLOPT_URL, $url);
+  curl_setopt($curl_request, CURLOPT_POST, 1);
+  curl_setopt($curl_request, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_1_0);
+  curl_setopt($curl_request, CURLOPT_HEADER, 1);
+  curl_setopt($curl_request, CURLOPT_SSL_VERIFYPEER, 0);
+  curl_setopt($curl_request, CURLOPT_RETURNTRANSFER, 1);
+  curl_setopt($curl_request, CURLOPT_FOLLOWLOCATION, 0);
+
+  $jsonEncodedData = json_encode($parameters);
+
+  $post = array(
+    "method" => $method,
+    "input_type" => "JSON",
+    "response_type" => "JSON",
+    "rest_data" => $jsonEncodedData
+  );
+
+  curl_setopt($curl_request, CURLOPT_POSTFIELDS, $post);
+  $result = curl_exec($curl_request);
+  curl_close($curl_request);
+
+  $result = explode("\r\n\r\n", $result, 2);
+  $response = json_decode($result[1]);
+  ob_end_flush();
+
+  return $response;
+}
+
+/*
+ * Get mappings and other configs based on name,
+ * works similar to drupal var_get but using non bootstrapped tables
+ */
+function sugar_mapping_get_config($name) {
+  $query = db_select('sugar_mapping_settings', 'sms')
+    ->fields('sms')
+    ->condition('name', $name)
+    ->range(0, 1)
+    ->execute();
+  $result = $query->fetchObject();
+
+  if (empty($result) || !$result) {
+    return FALSE;
+  }
+  $data = @unserialize($result->value);
+  if ($data === 'b:0;' || $data !== FALSE) {
+    if (isset($data['just_string'])) {
+      return $data['just_string'];
+    }
+    else {
+      return $data;
+    }
+  }
+  else {
+    watchdog('problem with config');
+    return FALSE;
+  }
+}
+
+/*
+ * Set mappings and other configs based on name,
+ * works similar to drupal var_set but using non bootstrapped tables
+ */
+function sugar_mapping_set_config($name, $data) {
+
+  $query = db_select('sugar_mapping_settings', 'sms')
+    ->fields('sms')
+    ->condition('name', $name, "=")
+    ->range(0, 1)
+    ->execute();
+  $result = $query->fetchObject();
+
+  if (is_array($data) || is_object($data)) {
+    $data = serialize($data);
+  }
+  else {
+    $data = serialize(array('just_string' => $data));
+  }
+
+  if (!$result) {
+    return db_insert('sugar_mapping_settings')
+      ->fields(array(
+        'name' => $name,
+        'value' => $data,
+      ))
+      ->execute();
+  }else {
+    return db_update('sugar_mapping_settings')
+      ->fields(array('value' => $data))
+      ->condition('id', $result->id, '=')
+      ->execute();
+  }
+}
+
+/*
+ * List of teams for the "assign to " field
+ */
+
+function sugar_get_teams_list() {
+  $sugar = sugar_initialize();
+  $parameters = array();
+  $teams = $sugar->getEndpoint('GetAllTeams', $parameters);
+  $teams['none'] = "--none--";
+  return $teams;
+}
+
+function extract_attachment_fields(&$map) {
+  $attachment_fields = array();
+  foreach ($map as $k => $v) {
+    if (!empty($v['fileupload'])) {
+      array_push($attachment_fields, array('file_id' => $v['fileupload'], 'label' => $v['filelabel']));
+      unset($map[$k]);
+    }
+  }
+  return $attachment_fields;
+
+}
+
+/*
+ * Submit handler for mapped form submissions
+ */
+function sugarcrm_bridge_webform_mapping_client_submit($form, &$form_state, $decouple_vars = NULL) {
+  if (variable_get('decouple_submissions') == 1 && is_null($decouple_vars)) {
+    _send_to_queue($form_state, __FUNCTION__);
+    return NULL;
+  }
+  $sugar = sugar_initialize();
+
+  $nid = isset($form['#node']->nid) ? $form['#node']->nid : $form_state['complete form']['#node']->nid;
+  $existing_config = sugar_mapping_get_config($nid);
+
+  if (empty($existing_config)) {
+    watchdog('big problem', 'if a form is configured to use this, why does it not have a config');
+  }
+  $params['form_name'] = $form_state['complete form']['#node']->title;
+  $params['assign_to_team'] = check_empty($existing_config['assign_to_team']);
+  $params['create_email'] = check_empty($existing_config['create_email']);
+  $to_sugar = array();
+  $email = "";
+
+
+  foreach ($existing_config['relationships'] as $k => $v) {
+    if($v['module'] == 'none'){continue;}
+    if ($v['module'] == 'Contacts' && $v['field'] == 'email1') {
+      $email = $form_state['values']['submitted'][$k];
+    }
+
+   // if ($v['module'] == 'Cases' && $v['field'] == 'description') {
+    if ( $v['field'] == 'description' ) {
+      if (!isset($to_sugar[$v['module']][$v['field']])) {
+        $intro = ($v['module'] != 'Cases') ? $params['form_name'] : "";
+        $to_sugar[$v['module']][$v['field']] = $intro . "\n\n" . sugarcrm_bridge_webform_mapping_description_field($v['label'], $form_state['values']['submitted'][$k],$form_state['values']['submitted']);
+      }
+      else {
+        $to_sugar[$v['module']][$v['field']] .= sugarcrm_bridge_webform_mapping_description_field($v['label'], $form_state['values']['submitted'][$k],$form_state['values']['submitted']);
+      }
+    }
+    else {
+      $fieldname = $v['type'] == 'file' ? 'file' . microtime() : $v['field'];
+      $to_sugar[$v['module']][$fieldname] = sugarcrm_bridge_webform_mapping_process_mapped_value($sugar, $form_state['values']['submitted'][$k], $v['type'],$form_state['values']['submitted'], $form);
+
+    }
+
+  }
+
+  $contact = "";
+  if(isset($to_sugar['Contacts'])){
+    $contact = _get_contact($sugar, $email);
+
+    $contact = sugarcrm_bridge_webform_mapping_create_or_update_contact($sugar, $contact, $to_sugar['Contacts'], $params);
+    unset($to_sugar['Contacts']);
+
+  }
+
+
+  if(isset($to_sugar['Cases'])){
+
+
+    sugarcrm_bridge_webform_mapping_create_case($sugar, $contact, $to_sugar['Cases'], $params);
+    unset($to_sugar['Cases']);
+
+  }
+
+  foreach($to_sugar as $module => $map){
+    $contact_id = !empty($contact['id']) ? $contact['id'] : '';
+    sugarcrm_bridge_webform_mapping_write_to_module($sugar, $module, $map, $contact_id);
+  }
+
+}
+
+
+function sugarcrm_bridge_webform_mapping_create_case($sugar, $contact, $mapping, $params){
+
+  $attachments = extract_attachment_fields($mapping);
+
+  $mapping['name'] = check_empty($mapping['name'] ,'Submission From ' . $params['form_name'] );
+  $mapping['contact_id_c'] = check_empty($contact['id']);
+  $mapping['team_id'] = check_empty($params['assign_to_team']);
+  $mapping['account_name'] = check_empty($contact['account_name']);
+  $mapping['account_id'] = check_empty($contact['account_id']);
+  $mapping['primary_contact_email_c'] = $contact['email1'];
+
+  $case = $sugar->create('Cases', $mapping);
+  $sugar->relate('Contacts', $contact['id'] , 'cases', $case['id']);
+
+  if($params['create_email'] == 1){
+    $team_emails = team_emails();
+    $email_parameters = array(
+      'name' =>  $mapping['name'],
+      'from_addr_name' =>$contact['name'] ."<" . $mapping['primary_contact_email_c'] .">",
+      'to_addrs_names' => check_empty($team_emails[$mapping['team_id']]),
+      'mailbox_id' => check_empty($mapping['team_id']),
+      'type' => 'inbound',
+      'description_html' =>  str_replace("\n", "<br/>",$mapping['description']),
+      'parent_type' => 'Cases',
+      'parent_id' => $case['id'],
+    );
+    $sugar->create('Emails',$email_parameters);
+  }
+  if(!empty($attachments)){
+    foreach($attachments as $a){
+      $file = file_load($a['file_id']);
+      $realpath = drupal_realpath($file->uri);
+      $note = $sugar->create('Notes', array(
+        'name' => 'Attachment: ' . $a['label'],
+        'description' => "File: " .  $file->filename )
+      );
+      $sugar->upload('Notes',$note['id'],'filename',$realpath,array('format' => $file->filemime, 'filename' => "filenamename" ));
+      $sugar->relate('Cases', $case['id'], 'notes', $note['id']);
+    }
+  }
+}
+
+function sugarcrm_bridge_webform_mapping_write_to_module($sugar, $module, $map, $contact_id){
+  $attachments = extract_attachment_fields($map);
+  $record = $sugar->create($module, $map);
+  if(!empty($attachments)){
+    foreach($attachments as $a){
+      $file = file_load($a['file_id']);
+      $realpath = drupal_realpath($file->uri);
+      $note = $sugar->create('Notes', array(
+          'name' => 'Attached File',
+          'description' => "Attachment: " . $a['label'])
+      );
+      $sugar->upload('Notes',$note['id'],'filename',$realpath,array('format' => $file->filemime, 'filename' => "filenamename", ));
+      $sugar->relate($module, $record['id'], 'notes', $note['id']);
+    }
+  }
+
+}
+
+function sugarcrm_bridge_webform_mapping_create_or_update_contact($sugar, $contact, $mapping, $params) {
+
+  if (empty($contact['records'])) {
+    $contact = $sugar->create('Contacts', $mapping);
+    _new_contact_note($sugar, $contact['id'], $params['form_name'], $mapping, $contact);
+  }
+  else {
+    $contact = $contact['records'][0];
+    $skipped_fields = array();
+
+    foreach ($mapping as $k => $v) {
+      if (!empty($contact[$k])) {
+        if (is_array($contact[$k])) {
+            $mapped_array = (is_array($mapping[$k]) ? $mapping[$k] : array($mapping[$k]));
+            $mapping[$k] = array_unique(array_merge($contact[$k], $mapped_array));
+        } else if (!array_key_exists($k, $contact) || $contact[$k] != ""){
+          $skipped_fields[$k] = $mapping[$k];
+          unset($mapping[$k]);
+        }
+      }
+    }
+    $contact = $sugar->update('Contacts', $contact['id'], $mapping);
+    _updated_contact_note($sugar, $contact['id'], $params['form_name'], $mapping, $contact, $skipped_fields);
+
+
+  }
+  return $contact;
+}
+
+
+function sugarcrm_bridge_webform_mapping_description_field($field, $content, $submitted) {
+
+  if(is_array($content)){
+    $content = implode(", ",array_values($content));
+  }else{
+    preg_match_all('~\{\{(.*?)\}\}~', $content, $matches);
+    foreach($matches[1] as $match){
+      $content = str_replace('{{' . $match . '}}', $submitted[$match], $content);
+    }
+  }
+  return sprintf("%s:\n%s\n\n", $field, $content);
+}
+
+function sugarcrm_bridge_webform_mapping_process_mapped_value($sugar, $value, $type, $submitted, $form = null) {
+  switch ($type) {
+    case 'select':
+      if(is_array($value)){
+        $value = array_values($value);
+      }
+      break;
+    case 'select_multi':
+      if(is_array($value)){
+        $value = array_values($value);
+      }else{
+        $value = array($value);
+      }
+      break;
+    case 'hidden':
+
+      if (preg_match_all('~\{\{(.*?)\}\}~', $value, $matches)){
+        foreach($matches[1] as $match){
+          if(is_array($submitted) ){
+            $value = str_replace('{{' . $match . '}}', $submitted[$match], $value);
+          }
+        }
+      }
+      break;
+    case 'file':
+      $filekey = array_search($value,$submitted);
+      $label = $form['#node']->webform['components'][$filekey]['name'];
+      $value = array('fileupload' => $value, 'filelabel' => $label);
+      break;
+
+  }
+
+
+
+  return $value;
+}
+
+function team_emails(){
+
+  $team_emails = array(
+    "6303e407-73e7-6d4b-03e6-53e4ea971676" => "user_services@aluka.org",
+    "96efd40f-ad5e-14fc-17cc-53e4eaa3a099" => "production@aluka.org",
+    "4143926e-fba5-7f42-3e63-53e1a30f585a" => "CD-ContentDevelopment@ithaka.org",
+    "dbc9545e-ccc6-0357-9e7c-543e7f99865b" => "discoveryservices@ithaka.org",
+    "ce0876f8-6df9-fa86-7237-53e0feb40723" => "fulfillment@ithaka.org",
+    "ea0b4851-3024-7757-6a5c-543ec6e001b3" => "events@ithaka.org",
+    "364bb12e-397f-19f7-3613-542b6d1727ba" => "info@ithaka.org",
+    "1a51b1ac-338a-1016-21f1-542b6e5ce066" => "info@sr.ithaka.org",
+    "229283eb-7fd3-719d-2b81-53e5182dd1d4" => "announcements@jstor.org",
+    "bdf9417d-26cc-a3fa-e9ff-543ec61a4f89" => "education@ithaka.org",
+    "45de6f5c-70a4-de87-2d83-562a2719bdf2" => "pss@jstor.org",
+    "6c2fc505-c7dd-ebdf-aeec-545688fdd626" => "publishernews@jstor.org",
+    "5c276346-92e4-ae83-31fb-53e1a1354be8" => "participation@jstor.org",
+    "50982479-7415-74c8-7109-53e4ebfbdc3d" => "service@ithaka.org",
+    "7d44663f-4922-293d-a896-53e4ea9632c2" => "techsupport@ithaka.org",
+    "6dcc1586-44f2-f033-1cfe-53e4ea6f9286" => "support@jstor.org",
+    "d906ebab-49c6-8351-3fe3-53e4ea75d87c" => "acquisitions@jstor.org"
+    );
+
+  /*
+   * <select id="edit-assign-to-team" name="assign_to_team" class="form-select valid"><option value="6303e407-73e7-6d4b-03e6-53e4ea971676">Aluka Content Development</option><option value="96efd40f-ad5e-14fc-17cc-53e4eaa3a099">Aluka Production</option><option value="1aadb35f-341a-a208-45e0-54261644c909">Business Systems</option><option value="4143926e-fba5-7f42-3e63-53e1a30f585a">Content Development</option><option value="de86b243-aff2-cc14-d4f3-53e1a3279f42">Content Management</option><option value="91487324-991b-6d3f-b9a4-54261633bdea">Finance</option><option value="dbc9545e-ccc6-0357-9e7c-543e7f99865b">ITHAKA Discovery Services</option><option value="ce0876f8-6df9-fa86-7237-53e0feb40723">ITHAKA Fulfillment &amp; Licensing</option><option value="ea0b4851-3024-7757-6a5c-543ec6e001b3">ITHAKA M&amp;C: Events</option><option value="2dcb01e7-de39-9bce-170d-53459ee98782">ITHAKA M&amp;C: General</option><option value="364bb12e-397f-19f7-3613-542b6d1727ba">ITHAKA M&amp;C: ITHAKA Info</option><option value="1a51b1ac-338a-1016-21f1-542b6e5ce066">ITHAKA M&amp;C: Ithaka S+R Info</option><option value="229283eb-7fd3-719d-2b81-53e5182dd1d4">ITHAKA M&amp;C: JSTOR Announcements</option><option value="bdf9417d-26cc-a3fa-e9ff-543ec61a4f89">ITHAKA M&amp;C: JSTOR Education</option><option value="45de6f5c-70a4-de87-2d83-562a2719bdf2">ITHAKA M&amp;C: PSS Inquiries</option><option value="6c2fc505-c7dd-ebdf-aeec-545688fdd626">ITHAKA M&amp;C: Publisher News</option><option value="5c276346-92e4-ae83-31fb-53e1a1354be8" selected="selected">ITHAKA Outreach &amp; Participation Services</option><option value="50982479-7415-74c8-7109-53e4ebfbdc3d">ITHAKA User Services: Individual Access Support</option><option value="7d44663f-4922-293d-a896-53e4ea9632c2">ITHAKA User Services: Technical Support</option><option value="6dcc1586-44f2-f033-1cfe-53e4ea6f9286">ITHAKA User Services: Website Support</option><option value="d906ebab-49c6-8351-3fe3-53e4ea75d87c">JSTOR Acquisitions</option><option value="68868bf1-0503-2354-a26e-567086251a4a">JSTOR Labs</option><option value="ed550dfd-d34f-8b53-8c76-543e81b012bc">JSTOR Plant Science</option><option value="dead9eb2-0301-9ce0-31cd-53e1a9e3a6fb">Office of the General Counsel</option><option value="6840403d-e4d7-de71-dc6e-5426160fc9b0">Outreach Analytics</option><option value="7b407754-4f9a-46eb-4d35-53e51a2ea438">Spam</option><option value="none">--none--</option></select>
+   */
+    return $team_emails;
+
+}

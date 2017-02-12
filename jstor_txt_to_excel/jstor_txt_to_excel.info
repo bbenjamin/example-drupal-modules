@@ -1,0 +1,6 @@
+name = JSTOR Text To Excel
+description = This module uses cron to once per week refresh the entire title list of the site based on external KBART, and once per day, creates new excel title lists for each collection
+package = JSTOR
+version = "7.x-1.0"
+core = "7.x"
+project = "ITHAKA"

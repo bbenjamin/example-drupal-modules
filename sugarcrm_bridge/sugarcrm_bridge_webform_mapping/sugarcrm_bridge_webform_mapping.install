@@ -1,0 +1,29 @@
+<?php
+
+function sugarcrm_bridge_webform_mapping_schema() {
+  $schema['sugar_mapping_settings'] = array(
+    'fields' => array(
+      'id' => array(
+        'description' => 'The primary identifier.',
+        'type' => 'serial',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+      ),
+      'name' => array(
+        'description' => 'Name',
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+      ),
+      'value' => array(
+        'description' => 'Value',
+        'type' => 'blob',
+        'size' => 'big',
+        'not null' => TRUE,
+      ),
+    ),
+    'primary key' => array('id'),
+  );
+  //db_create_table('sugar_mapping_settings', $schema['sugar_mapping_settings']);
+    return $schema;
+}

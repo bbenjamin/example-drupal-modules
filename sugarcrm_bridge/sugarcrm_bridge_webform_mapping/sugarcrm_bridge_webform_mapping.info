@@ -1,0 +1,9 @@
+name = SugarCRM Bridge Webform Mapping
+description = Adds webform config to map fields to Sugar via GUI - no code changes needed!
+core = 7.x
+package = JSTOR
+version = "7.x-1.0"
+core = "7.x"
+dependencies[] = sugarcrm_bridge
+dependencies[] = webform
+

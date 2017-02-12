@@ -1,0 +1,366 @@
+<?php
+function jpass_importer_menu(){
+
+    /*This is a test page that force-triggers the feed without requiring cron
+    and presents debug info */
+    $items['admin/structure/xmlfeed/feed'] = array(
+        'page callback' => 'jpass_importer_getfeed',
+        'access callback' => 'user_is_logged_in',
+        'title'=> 'The Following Have Been Added',
+        'type' => MENU_CALLBACK,
+    );
+    /* page with options to enter feed urls, purge feed data, and force run feed */
+    $items['admin/structure/xmlfeed/feed-settings'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('jpass_feed_settings_form'),
+        'title'=> 'Feed Settings',
+        'type' => MENU_CALLBACK,
+    );
+    /* this is an 'are you sure' page that comes up prior to purging imported content*/
+    $items['admin/structure/xmlfeed/import-purge'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('jpass_importer_purge_form'),
+        'title'=> 'Remove All Imported Content',
+        'type' => MENU_CALLBACK,
+    );
+    return $items;
+}
+
+function jpass_feed_settings_form(){
+    /* Form field for URL with title feed data - 2nd param is default if variable has not been created */
+    $feed_url = variable_get('feed_url','http://beetle.jstor.org/action/feeds?feedId=jpasstitles&feedName=jpass-all&source=literatum');
+    $form['url'] = array(
+        '#type'	=> 'textfield',
+        '#default_value' => $feed_url,
+        '#title' => t('Url for jpass datafeed'),
+    );
+    /*  links to elysia cron config page, force run importer, and title data purge */
+    $form['cron'] = array(
+        '#markup' => '<ul><li>You can customize importer cron intervals ' . l('here', 'admin/config/system/cron/settings') .
+            ' <em>(use the "schedule rule" option for jpass_importer_cron)</em>'.
+            '</li><li>You can force-run the importer ' . l('here', 'admin/structure/xmlfeed/feed') .
+            '</li><li>You can delete EVERY imported item and start fresh ' . l('here', 'admin/structure/xmlfeed/import-purge') . '</li></ul>',
+    );
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'Submit Changes',
+    );
+    return $form;
+}
+
+function jpass_feed_settings_form_submit($form, &$form_state){
+    variable_set('feed_url', $form_state['values']['url']);
+}
+
+function jpass_importer_purge_form(){
+    /* verify that user REALLY wants to purge title data */
+    $form['message'] = array(
+        '#markup' => '<h4>This will delete ALL imported content (Collection Discipline, Offer, Publisher, and Publication).</h4><h4>Are you sure?</h4>',
+    );
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'I am sure!',
+    );
+    return $form;
+}
+
+function jpass_importer_purge_form_submit($form, &$form_state){
+    /* db queries to remove all publications, publishers, offers and disciplines */
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'collection_discipline'));
+    $result = $q->fetchAll();
+    foreach($result as $r){
+        node_delete($r->nid);
+    }
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'offer'));
+    $result = $q->fetchAll();
+    foreach($result as $r){
+        node_delete($r->nid);
+    }
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'publication'));
+    $result = $q->fetchAll();
+    foreach($result as $r){
+        node_delete($r->nid);
+    }
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'publisher'));
+    $result = $q->fetchAll();
+    foreach($result as $r){
+        node_delete($r->nid);
+    }
+    drupal_set_message('All imported content has been deleted!');
+    drupal_goto('feed-settings');
+}
+
+function jpass_importer_cron(){
+    jpass_importer_getfeed();
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'collection_subject'));
+    $result = $q->fetchAll();
+    foreach($result as $r){
+        node_save($r->nid);
+    }
+}
+
+function jpass_importer_getfeed(){
+    $feed_url = variable_get('feed_url','http://beetle.jstor.org/action/feeds?feedId=jpasstitles&feedName=jpass-all&source=literatum');
+    $chinit = curl_init($feed_url);
+    curl_setopt($chinit, CURLOPT_COOKIEJAR, '/tmp/cookies.txt');//Any temp location no need to check file is present or not
+    curl_setopt($chinit, CURLOPT_COOKIEFILE, '/tmp/cookies.txt');
+    curl_setopt($chinit, CURLOPT_FOLLOWLOCATION, true);
+    curl_setopt($chinit, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($chinit, CURLOPT_HEADER, 0);
+    $data = curl_exec($chinit);
+    $info = curl_getinfo($chinit);
+    if($info['http_code'] != 200){
+        $error = "Could not retrieve XML, http error " .  $info['http_code'];
+        drupal_set_message($error);
+        watchdog('Importer', $error);
+        return;
+    }
+    $titls = json_decode(json_encode((array)simplexml_load_string($data)),1);
+   
+    $newTitles = array();
+    foreach($titls['FeedInfo']['FeedRecord'] as $t){
+        array_push($newTitles, $t['@attributes']['dataId']);
+    }
+    $existingTitles = db_select('node','n')
+        ->condition('type', 'publication')
+        ->fields('n',array('nid','title'))
+        ->execute()
+        ->fetchAll();
+
+    foreach($existingTitles as $eTitle){
+        if(!in_array($eTitle->title, $newTitles)){
+            node_delete($eTitle->nid);
+            watchdog('Importer', 'Removed Publication ' . $eTitle->title);
+        }
+    }
+    //creating debug strings
+    $titles = "<strong>TITLES</strong><br/>";
+    $offers = "<strong>OFFERS</strong><br/>";
+    $dis = "<strong>DISCIPLINES</strong><br/>";
+    $pub = "<strong>PUBLISHERS</strong><br/>";
+    //end debug strings
+
+
+    foreach($titls['FeedInfo']['FeedRecord'] as $t){
+        $res = db_select('node','n')
+            ->condition('title',html_entity_decode($t['@attributes']['dataId']))
+            ->condition('type', 'publication')
+            ->fields('n',array('nid','changed'))
+            ->execute()
+            ->fetchAssoc();
+        //if title doesn't exist, create new node
+        //else, see if the existing title has been changed since the last time it was updated on the site
+        //if no change, loop through to next title.
+        if(empty($res)){
+            $node = new stdClass();
+            $node->type = 'publication';
+            $node->language = 'und';
+            $node->title = html_entity_decode($t['@attributes']['dataId']);
+        }else{
+            if(isset($t['@attributes']['lastChanged']) && $res['changed'] < $t['@attributes']['lastChanged']){continue;}
+            $node = node_load($res['nid']);
+            //existing nodes being updated will have offer and discipline entires removed before updating
+            //so there are not duplicate references
+            unset($node->field_offer['und']);
+            unset($node->field_discipline['und']);
+        }
+        //The title seen by the public is different than the ID
+        $node->field_public_title['und'][0]['value'] = html_entity_decode($t['JPASSTitleData']['@attributes']['title']);
+
+        /*  The date range in XML is one field, which needs to be stored as discrete start and end dates */
+        if(!empty($t['JPASSTitleData']['offers']['offer'][0]['@attributes']['offerTitleRange'])){
+            $range = $t['JPASSTitleData']['offers']['offer'][0]['@attributes']['offerTitleDateRange'];
+            if(strpos($range,"-")){
+                $dates = explode('-', $range);
+                $node->field_date_range_start['und'][0]['value'] = $dates[0];
+                $node->field_date_range_end['und'][0]['value'] = $dates[1];
+            }else{
+                $node->field_date_range_start['und'][0]['value'] = $range;
+                $node->field_date_range_end['und'][0]['value'] = $range;
+            }
+        }
+
+        /*  retrieve lovi URL from XML */
+        if(isset($t['JPASSTitleData']['@attributes']['loviURL'])){
+            $node->field_lovi_url['und'][0]['value'] = $t['JPASSTitleData']['@attributes']['loviURL'];
+        }else{
+            watchdog('Importer' ,'no lovi url for ' . html_entity_decode($t['JPASSTitleData']['@attributes']['title']));
+        }
+
+        /*for debug info */
+        $titles .= $t['JPASSTitleData']['@attributes']['title'] . '<br/>';
+
+        /*check each discipline, subject and offer. If nodes exist for them, just create reference. If they are new, create a new
+       node for the corresponding content type THEN create a reference. */
+        if(isset($t['JPASSTitleData']['offers'])){
+            foreach($t['JPASSTitleData']['offers']['offer'] as $o){
+                $offer = html_entity_decode($o['@attributes']['description']);
+                $node->field_offer['und'][]['nid'] = jpass_importer_make_reference(array('title' => $offer, 'type' => 'offer'));
+                $offers .= $offer . '<br/>';
+            }
+        }
+
+        if(isset($t['JPASSTitleData']['disciplines'])){
+            if(!empty($t['JPASSTitleData']['disciplines'])){
+                foreach($t['JPASSTitleData']['disciplines']as $d){
+                    if(empty($d)){
+                        continue;
+                    }
+                    if(isset($d[1])){
+                        foreach($d as $dsub){
+                            //$discipline = html_entity_decode($dsub['@attributes']['description']);
+                            //$node->field_discipline['und'][]['nid'] = jpass_importer_make_reference(array('title' => $discipline, 'type' => 'collection_discipline'));
+                            $dis .= $dsub['@attributes']['description'] . '<br/>';
+                            if(isset($dsub['subjects']['subject']['@attributes']['description']) && !empty($dsub['subjects']['subject']['@attributes']['description'])){
+                                $subject = html_entity_decode($dsub['subjects']['subject']['@attributes']['description']);
+                                $node->field_pub_subject['und'][]['nid'] = jpass_importer_make_reference(array('title' => $subject, 'type' => 'collection_subject'));
+                            }
+                        }
+                    }else{
+                        if(isset($d['@attributes']['description'])){
+                            //$discipline = html_entity_decode($d['@attributes']['description']);
+                            //$node->field_discipline['und'][]['nid'] = jpass_importer_make_reference(array('title' => $discipline, 'type' => 'collection_discipline', 'flag' => true));
+                            $dis .= $d['@attributes']['description'] . '<br/>';
+                        }
+                        if(isset($d['subjects']['subject']['@attributes']['description']) ){
+                            $subject = html_entity_decode($d['subjects']['subject']['@attributes']['description']);
+                            $node->field_pub_subject['und'][]['nid'] = jpass_importer_make_reference(array('title' => $subject, 'type' => 'collection_subject', 'flag' => true));
+                        }
+                    }
+                }
+            }
+        }
+        /* get publisher data from XML */
+        if(isset($t['JPASSTitleData']['@attributes']['publisherName'])){
+            $pub .= $t['JPASSTitleData']['@attributes']['publisherName'] . '<br/>';
+            $publisher = html_entity_decode($t['JPASSTitleData']['@attributes']['publisherName']);
+            $url = '';
+            if(isset($t['JPASSTitleData']['@attributes']['publisherURL'])){
+                $url = html_entity_decode($t['JPASSTitleData']['@attributes']['publisherURL']);
+            }
+            $node->field_publisher['und'][]['nid'] = jpass_importer_make_reference(array('title' => $publisher, 'type' => 'publisher', 'url' => $url));
+        }
+        node_save($node);
+    }
+    $handle = fopen("jpass_from_litz.txt","w");
+    fwrite($handle,$titles);
+    fclose($handle);
+
+    /* assemble debug string for display on page that appears if feed is manually imported (/feed url) */
+    //$added = $titles . $offers . $dis . $pub;
+    $added = "<h1>hey nong man</h1>";
+    watchdog("TITLES", $titles);
+    return $added;
+}
+
+//Based on node title and content type, returns NID of item that the calling node wants
+// to reference.
+function jpass_importer_make_reference($params){
+    $res = db_select('node','n')
+        ->condition('title',$params['title'])
+        ->condition('type', $params['type'])
+        ->fields('n',array('nid'))
+        ->execute()
+        ->fetchAssoc();
+    if(empty($res)){
+        $node = new stdClass();
+        $node->type = $params['type'];
+        $node->language = 'und';
+        $node->title = $params['title'];
+        //add url information for publisher type
+        if($params['type'] == 'publisher' && isset($params['url'])){
+            $node->field_pub_url['und'][0]['value'] = $params['url'];
+        }
+        node_save($node);
+        return $node->nid;
+    }else{
+        return $res['nid'];
+    }
+}
+
+function jpass_importer_node_presave($node){
+    if($node->type == 'publication'){
+        /*save the publisher reference as text */
+        if(isset($node->field_publisher['und'][0]['nid'])){
+            $subject = node_load($node->field_publisher['und'][0]['nid']);
+            if(!is_numeric($subject->title)){
+                $node->field_publisher_as_text['und'][0]['value'] = $subject->title;
+            }
+        }
+
+        /* take the first (or only) subject associated with the publication node and
+         * make it the "first subject" so there is a single subject that makes the titles sortable
+         */
+
+        if(isset($node->field_pub_subject['und'][0]['nid'])){
+            $subject = node_load($node->field_pub_subject['und'][0]['nid']);
+            $node->field_first_subject['und'][0]['value'] = isset($subject->field_display_title['und'][0]['value']) ? strip_tags($subject->field_display_title['und'][0]['value']) : $subject->title;
+            $node->field_first_subject_reference['und'][0]['nid'] = $node->field_pub_subject['und'][0]['nid'];
+        }
+        /* This reviews start and end dates and creates node references for each
+         * date range it overlaps with */
+        if($node->is_new){
+            if(!isset($node->field_date_range_start['und'][0]['value'])){
+                watchdog('tha node no date', $node->title);
+            }
+            $start = $node->field_date_range_start['und'][0]['value'];
+            $end = $node->field_date_range_end['und'][0]['value'];
+            $res = db_select('node','n')
+                ->condition('type', 'date_range')
+                ->fields('n',array('nid'))
+                ->execute()
+                ->fetchAll();
+            foreach($res as $r){
+                $daterange = node_load($r->nid);
+                $dstart = $daterange->field_range_start['und'][0]['value'];
+                $dend = $daterange->field_range_end['und'][0]['value'];
+                if($dend == 'Current'){
+                    $dend = date('Y', time());
+                }
+                if($start <= $dend && $end >= $dstart){
+                    $node->field_date_range_s['und'][]['nid'] = $r->nid;
+                }
+            }
+        }
+        $date_range_text = $node->field_date_range_start['und'][0]['value'];
+        if( !empty($node->field_date_range_end['und'][0]['value']) && $node->field_date_range_start['und'][0]['value'] != $node->field_date_range_end['und'][0]['value']){
+
+            $date_range_text .=  "-" . $node->field_date_range_end['und'][0]['value'];
+        }
+        $node->field_date_range_as_text['und'][0]['value'] = $date_range_text;
+    }
+}
+
+function jpass_importer_init(){
+    /* The collections page does not know how to accept the default "show all" fields without submitting the search form*/
+    /* As a worksround, the code below searches for blank GET variables and creates defaults in the URL to fool the form into thinking
+     * it was submitted
+     */
+    if(arg(0) == 'collections' && isset($_GET['field_first_subject_reference_nid_1'])){
+        if(!isset($_GET['field_public_title_value'])){
+            $_GET['field_public_title_value'] = '';
+        }
+        if(!isset($_GET['field_publisher_nid'])){
+            $_GET['field_publisher_nid'] = 'All';
+        }
+        if(!isset($_GET['field_date_range_s_nid'])){
+            $_GET['field_date_range_s_nid'] = 'All';
+        }
+
+
+    }
+    if(arg(0) == 'collections' && !isset($_GET['field_first_subject_reference_nid_1'])){
+        $_GET['field_first_subject_reference_nid_1'] = 'All';
+        if(!isset($_GET['field_public_title_value'])){
+            $_GET['field_public_title_value'] = '';
+        }
+        if(!isset($_GET['field_publisher_nid'])){
+            $_GET['field_publisher_nid'] = 'All';
+        }
+        if(!isset($_GET['field_date_range_s_nid'])){
+            $_GET['field_date_range_s_nid'] = 'All';
+        }
+    }
+}

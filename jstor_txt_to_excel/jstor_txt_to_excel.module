@@ -1,0 +1,281 @@
+<?php
+function jstor_txt_to_excel_cron() {
+  jstor_txt_to_excel_make_xls();
+}
+
+function jstor_txt_to_excel_menu() {
+  #This URL triggers the import of the XML subscriber list and generates a new table
+  $items['onecollection'] = array(
+    'access callback' => 'user_is_logged_in',
+    'page callback' => 'jstor_txt_to_excel_make_xls',
+    'title' => 'MAKE A TITLES!',
+    'page arguments' => array(1),
+  );
+  return $items;
+}
+
+function jstor_txt_to_excel_cronapi($op, $job = NULL) {
+  $items['reset_archive_title_list'] = array(
+    'description' => 'Remove All Archive Titles and rebuild from KBART',
+    'rule' => '50 4 * * 1',
+    'callback' => 'reset_archive_title_list',
+
+  );
+
+  return $items;
+}
+
+function reset_archive_title_list(){
+  $result = db_select('node', 'n')
+    ->fields('n', array('nid'))
+    ->condition('type', 'collection_specific_archive_titl', '=')
+    ->execute();
+
+  $queue = DrupalQueue::get('delete_titles_queue');
+  foreach ($result as $record) {
+    $queue->createItem($record->nid);
+  }
+  $queue->createItem('completed');
+
+}
+
+
+
+function jstor_txt_to_excel_node_presave($node) {
+
+  if ($node->type == 'content_on_jstor_archival_collec' && isset($node->field_download_title_list_link['und'][0]['url']) && !empty($node->field_download_title_list_link['und'][0]['url'])) {
+    module_load_include('inc', 'phpexcel');
+    $fileurl = $node->field_download_title_list_link['und'][0]['url'];
+    $filename = trim($node->field_download_title_list_link['und'][0]['title']);
+    $filename = $filename . ".xls";
+
+    $chinit = curl_init($fileurl);
+    curl_setopt($chinit, CURLOPT_COOKIEJAR, '/tmp/cookies.txt');//Any temp location no need to check file is present or not
+    curl_setopt($chinit, CURLOPT_COOKIEFILE, '/tmp/cookies.txt');
+    curl_setopt($chinit, CURLOPT_FOLLOWLOCATION, TRUE);
+    curl_setopt($chinit, CURLOPT_RETURNTRANSFER, 1);
+    curl_setopt($chinit, CURLOPT_HEADER, 0);
+    $data = curl_exec($chinit);
+    curl_close($chinit);
+    $tabarray = explode("\n", $data);
+    if (count($tabarray) < 2) {
+      $tabarray = explode("\r", $data);
+    }
+    $headers['titles'] = explode("\t", $tabarray[0]);
+    unset($tabarray[0]);
+
+    $data = array();
+    foreach ($tabarray as $t) {
+      $data['titles'][] = explode("\t", $t);
+    }
+
+    $path = 'public://title_lists/' . $filename;
+    unlink($path);
+
+    $result = phpexcel_export($headers, $data, $path);
+    $move = file_get_contents($path);
+
+    $uploaded = file_save_data($move, array(), 'public://title_lists/', FILE_EXISTS_REPLACE);
+    $uploaded->filename = $filename;
+    $uploaded->status = FILE_STATUS_PERMANENT;
+    file_save($uploaded);
+    if ($result == PHPEXCEL_SUCCESS) {
+      unset($node->field_download_file_title_list['und'][0]);
+      $node->field_download_file_title_list['und'][0] = array(
+        'fid' => $uploaded->fid,
+        'display' => '1',
+        'description' => $filename,
+        'upload_button' => 'Upload',
+        'remove_button' => 'Remove',
+        'upload' => ''
+      );
+    }
+    else {
+      drupal_set_message(t("Oops ! An error occurred !"), 'error');
+    }
+  }
+}
+
+
+function jstor_txt_to_excel_cron_queue_info() {
+  return array(
+    'archive_title_list' => array(
+      'worker callback' => 'make_archive_titles_runner',
+      'time' => 40,
+    ),
+    'delete_titles_queue' => array(
+      'worker callback' => 'delete_archive_titles_runner',
+      'time' => 40,
+    ),
+    'rebuild_titles_queue' => array(
+      'worker callback' => 'rebuild_titles_runner',
+      'time' => 40,
+    ),
+  );
+
+}
+
+function rebuild_titles_runner($id){
+  jstor_txt_to_excel_make_xls();
+}
+
+function delete_archive_titles_runner($id){
+  if($id == 'completed'){
+
+    $queue = DrupalQueue::get('rebuild_titles_queue');
+
+    $queue->createItem('rebuild');
+  }else{
+    node_delete($id);
+  }
+}
+
+function make_archive_titles_runner($row) {
+
+  if (isset($row['node_to_save']) && !empty($row['node_to_save'])) {
+    $node = node_load($row['node_to_save']);
+    node_save($node);
+    return TRUE;
+  }
+  if (isset($row['final']) && !empty($row['final'])) {
+
+      $core = array('cache', 'cache_block', 'cache_filter', 'cache_form', 'cache_menu', 'cache_page', 'cache_path', 'cache_views', 'cache_views_data');
+      foreach($core as $table) {
+        cache_clear_all('*', $table, TRUE);
+      }
+      watchdog('Cache Flush','cleared cache after rebuilding title lists');
+    return TRUE;
+    }
+
+  if (empty($row[0]['publication_title'])) {
+    return TRUE;
+  }else{
+    $res = db_select('node', 'n')
+      ->fields('n')
+      ->condition('title', $row[0]['publication_title'], '=')
+      ->condition('type', 'collection_specific_archive_titl', '=')
+      ->execute()
+      ->fetchAll();
+  }
+
+  if (!empty($res)) {
+    $titlnode = node_load($res[0]->nid);
+    if (strpos($titlnode->field_title_list_collection['und'][0]['value'], $row[0]['the_collection']) === FALSE) {
+      $titlnode->field_title_list_collection['und'][0]['value'] = $titlnode->field_title_list_collection['und'][0]['value'] . " " . $row[0]['the_collection'] . "|";
+    }
+
+  }
+  else {
+    $titlnode = new stdClass();
+    $titlnode->type = 'collection_specific_archive_titl';
+    $titlnode->language = 'und';
+    $titlnode->status = 1; //(1 or 0): published or not
+    $titlnode->promote = 0; //(1 or 0): promoted to front page
+    $titlnode->comment = 0;
+    $titlnode->sticky = 0;
+    $titlnode->field_title_list_collection['und'][0]['value'] = $row[0]['collection'];
+    $titlnode->field_title_list_collection['und'][0]['value'] = $row[0]['the_collection'] . "|";
+  }
+  $titlnode->title = $row[0]['publication_title'];
+
+  $titlnode->field_title_list_publisher_name['und'][0]['value'] = $row[0]['publisher_name'];
+  $titlnode->field_title_list_print_identifie['und'][0]['value'] = $row[0]['print_identifier'];
+  $titlnode->field_title_list_online_identifi['und'][0]['value'] = $row[0]['online_identifier'];
+  $titlnode->field_title_list_date_first_issu['und'][0]['value'] = $row[0]['date_first_issue_online'];
+  $titlnode->field_title_list_num_first_vol_o['und'][0]['value'] = $row[0]['num_first_vol_online'];
+  $titlnode->field_title_list_num_first_issue['und'][0]['value'] = $row[0]['num_first_issue_online'];
+  $titlnode->field_title_list_date_last_issue['und'][0]['value'] = $row[0]['date_last_issue_online'];
+  $titlnode->field_title_list_num_last_vol_on['und'][0]['value'] = $row[0]['num_last_vol_online'];
+  $titlnode->field_title_list_num_last_issue_['und'][0]['value'] = $row[0]['num_last_issue_online'];
+  $titlnode->field_title_list_title_url['und'][0]['value'] = $row[0]['title_url'];
+  $titlnode->field_title_list_first_author['und'][0]['value'] = $row[0]['first_author'];
+  $titlnode->field_title_list_title_id['und'][0]['value'] = $row[0]['title_id'];
+  $titlnode->field_title_list_embargo_info['und'][0]['value'] = $row[0]['embargo_info'];
+  $titlnode->field_title_list_coverage_depth['und'][0]['value'] = $row[0]['coverage_depth'];
+  $titlnode->field_title_list_catalog_id_lccn['und'][0]['value'] = $row[0]['catalog_identifier_lccn'];
+  $titlnode->field_title_list_catalog_id_oclc['und'][0]['value'] = $row[0]['catalog_identifier_oclc'];
+  $titlnode->field_title_list_date_added_onli['und'][0]['value'] = $row[0]['num_first_vol_online'];
+  $titlnode->field_title_list_discipline['und'][0]['value'] = $row[0]['discipline'];
+  $titlnode->field_title_list_full_coverage['und'][0]['value'] = $row[0]['full_coverage'];
+
+  if (isset($row[0]['coverage_notes'])) {
+    $titlnode->field_title_list_coverage_notes['und'][0]['value'] = $row[0]['coverage_notes'];
+  }
+  else {
+    $titlnode->field_title_list_coverage_notes['und'][0]['value'] = $row[0]['notes'];
+  }
+  node_save($titlnode);
+  return TRUE;
+}
+
+function jstor_txt_to_excel_make_xls($nid = NULL) {
+
+  if (is_null($nid)) {
+    $q = db_query("select nid from node WHERE type=:type", array(':type' => 'content_on_jstor_archival_collec'));
+    $result = $q->fetchAll();
+  }
+  else {
+    $result = array($nid);
+  }
+  $queue = new stdClass();
+  foreach ($result as $r) {
+    if (is_null($nid)) {
+      $node = node_load($r->nid);
+    }
+    else {
+      $node = node_load($r);
+    }
+    if (isset($node->field_this_is_an_uber_collection['und'][0]['value']) &&
+      $node->field_this_is_an_uber_collection['und'][0]['value'] == '1'
+    ) {
+      continue;
+    }
+    if (isset($node->field_download_title_list_link['und'][0]['url'])) {
+      $titledata = drupal_http_request($node->field_download_title_list_link['und'][0]['url']);
+    }
+    else {
+      $titledata = array();
+      $message = "No title list URL for " . $node->title;
+      watchdog('archive importer', $message);
+      continue;
+    }
+
+    if (!isset($titledata->data)) {
+      $message = "Non Working Title List URL for " . $node->title;
+      watchdog('archive importer', $message);
+      continue;
+    }
+    $titlearray = explode("\n", $titledata->data);
+    $csv = array();
+
+    foreach ($titlearray as $t) {
+      array_push($csv, explode("\t", $t));
+    }
+
+    $keys = array_shift($csv);
+    $csv2 = array();
+    foreach ($csv as $i => $row) {
+      if (!isset($row[1])) {
+        continue;
+      }
+      if (count($keys) != count($row)) {
+
+      }
+      $csv2[] = array_combine($keys, $row);
+    }
+    $queue = DrupalQueue::get('archive_title_list');
+    foreach ($csv2 as $row) {
+      $row['the_collection'] = trim($node->title);
+      $queue->createItem(array($row));
+    }
+    $queue->createItem(array('node_to_save' => $node->nid));
+
+  }
+  $queue->createItem(array('final' => 'final'));
+  if (is_null($nid)) {
+    return "made it";
+  }
+}
+
+
+

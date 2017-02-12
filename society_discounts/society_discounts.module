@@ -1,0 +1,758 @@
+<?php
+function society_discounts_menu() {
+    /* Main page that lists discounts and includes a form for adding new ones*/
+    $items['admin/structure/discounts/society-discounts'] = array(
+        'page callback' => '_get_discounts',
+        'access callback' => 'user_is_logged_in',
+        //'page arguments' => array('society_discounts_form'),
+        'title'=> t('Society Discounts'),
+    );
+    /* currently inactive form for turning new discounts into multistep form entry */
+    $items['admin/structure/discounts/new-match'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('match_code_form'),
+        'title'=> t('Set Expiration Date For New Match Code'),
+        'type' => MENU_CALLBACK,
+    );
+    /* Page for editing existing indivdual discounts */
+    $items['admin/structure/discounts/edit-discount'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('discounts_instance_form',1),
+        'title'=> t('Edit Discount'),
+        'type' => MENU_CALLBACK,
+    );
+    /* Page for customizing expiration notifications */
+    $items['admin/structure/discounts/expiration-notifications'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('expiration_notification_form'),
+        'title'=> t('Expriation Notification Settings'),
+        'type' => MENU_CALLBACK,
+    );
+    /* url that triggers deletion of discount, returns to main discounts page */
+    $items['admin/structure/discounts/delete-discount'] = array(
+        'page callback' => 'discount_delete',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array(1),
+        'title'=> t('Delete Discount'),
+        'type' => MENU_CALLBACK,
+    );
+    /* for logging purposes, clicked through offers access this URL first before being redirected to main JPASS site*/
+    $items['offer'] = array(
+        'page callback' => 'jpass_offer',
+        'access callback' => true,
+        'page arguments' => array(1),
+        'title'=> t('Offer'),
+        'type' => MENU_CALLBACK,
+    );
+    $items['admin/structure/discounts/content/offer'] = array(
+        'page callback' => 'jpass_offer',
+        'access callback' => true,
+        'page arguments' => array(1),
+        'title'=> t('Offer'),
+        'type' => MENU_CALLBACK,
+    );
+    return $items;
+}
+
+
+
+function _get_discounts(){
+    $discount_form = drupal_get_form('society_discounts_form');
+    #if this were contributed module the view would be part of the module code
+    return views_embed_view('discounts') . drupal_render($discount_form);
+}
+
+function jpass_offer($url){
+    global $user;
+    $fakesession = array();
+
+    if(!isset($_SESSION) || empty($_SESSION)){
+        $fakesession = unserialize($user->session);
+    }
+
+
+    if(isset($_SESSION['soc'])){
+        $result = db_query("INSERT INTO society_redemptions (society,timestamp) VALUES(:society,:timestamp)",
+            array(':society' => $_SESSION['soc']['id'], ':timestamp' => time()));
+    }
+    if(isset($fakesession['soc'])){
+        $result = db_query("INSERT INTO society_redemptions (society,timestamp) VALUES(:society,:timestamp)",
+            array(':society' => $fakesession['soc']['id'], ':timestamp' => time()));
+    }
+    $soc = isset($_SESSION['soc']['society_id']) ? $_SESSION['soc']['society_id'] : $fakesession['soc']['society_id'];
+    $mc = isset($_SESSION['soc']['match_code']) ? $_SESSION['soc']['match_code'] : $fakesession['soc']['match_code'];
+   // watchdog('offer session', '<pre>' . print_r($_SESSION,1) . '</pre>');
+    $offercode = isset($_SESSION['soc']['offercode']) ? urlsafe_base64_encode($_SESSION['soc']['offercode']) : urlsafe_base64_encode($fakesession['soc']['offercode']) ;
+    $purchase_url = variable_get('purchase_url');
+    $purchase_url .= '/action/jpass?offerCode=' . $offercode . '&soc=' . $soc . '&mc=' . $mc;
+    watchdog('purchase url',$purchase_url);
+    drupal_goto($purchase_url);
+    return "To purchase";
+}
+
+function society_discounts_init(){
+
+    if(isset($_SESSION['soc'])){
+        if(isset($_GET['mc'])){
+            if(!isset($_SESSION['soc']['match_code']) || $_GET['mc'] != $_SESSION['soc']['match_code']){
+                unset($_SESSION['soc']);
+            }
+        }
+    }
+
+    if(empty($_SESSION['soc']) && isset($_GET['soc']) && isset($_GET['mc'])){
+        //if(isset($_GET['soc'])){
+        //$_SESSION['soc'] = $_GET['soc'];
+        $id = $_GET['soc'];
+        $match_code = $_GET['mc'];
+        $dbget = db_query("SELECT * FROM  society_records WHERE society_id = '{$id}'");
+        $dbresult = $dbget->fetchAll();
+        if(!empty($dbresult) && $match_code == $dbresult[0]->match_code){
+            $_SESSION['soc'] = array(
+                'id' =>  $dbresult[0]->id,
+                'society_id' =>  $dbresult[0]->society_id,
+                'society_name' =>  $dbresult[0]->society_name,
+                'monthly_discount' =>  $dbresult[0]->monthly_discount,
+                'yearly_discount' =>  $dbresult[0]->yearly_discount,
+                'active' =>  $dbresult[0]->active,
+                'threshold' =>  $dbresult[0]->threshold,
+                'threshold_disable' =>  $dbresult[0]->threshold_disable,
+                'threshold_email' =>  $dbresult[0]->threshold_email,
+                'monthly_url' =>  $dbresult[0]->monthly_url,
+                'yearly_url' =>  $dbresult[0]->yearly_url,
+                'offercode' =>  $dbresult[0]->offercode,
+                'copy' =>  $dbresult[0]->copy,
+                'expiration_date' =>  $dbresult[0]->expiration_date,
+                'match_code' => $dbresult[0]->match_code,
+            );
+        }
+
+    }
+
+}
+function society_discounts_views_pre_render(&$view){
+
+
+    if($view->name == 'what_is_jpass_' && $view->current_display == 'plans'){
+        /** data-products format
+         * data-product="Product Name;Product code; Quantity;Price"
+         **/
+        $purchase_url = variable_get('purchase_url','http://firefly.jstor.org');
+        $active = true;
+        if(isset($_SESSION['soc'])){
+            $dbget = db_query("SELECT * FROM  society_records WHERE society_id = '{$_SESSION['soc']['society_id']}'");
+            $dbresult = $dbget->fetchAll();
+            $a = $dbresult[0];
+            if($a->active == 0){
+                $active = false;
+            }
+            if(!empty($a->expiration_date) && $a->expiration_date < time() ){
+                $active = false;
+            }
+            if($a->threshold_disable > 0  ){
+                $getCount = db_query("SELECT * FROM  society_redemptions WHERE society = '{$a->id}'");
+                $count = $getCount->rowCount();
+                if($count > $a->threshold){
+                    $active = false;
+                }
+            }
+
+        }else{
+            $active = false;
+        }
+        if($active){
+            $discount = $_SESSION['soc'];
+            if(!empty($discount['copy'])){
+                $view->header['area']->options['content'] = '<p class="max-centered txtC txtLg font-cond">' . $discount['copy'] . '</p>';
+            }
+
+            foreach($view->result as $k => $r){
+                $mbox_label = "";
+                $url_parts = explode('=',$view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                $tracking_offer_code = $url_parts[1];
+
+                if($r->node_title == 'Monthly'){
+                    $mbox_label = 'data-conversionmbox="monthlyJpassConversion"';
+                    if(!empty($discount['monthly_discount'])){
+                        $oldPrice = '<span class="crossout">' . $view->result[$k]->field_field_line_1_price[0]['rendered']['#markup'] .'</span>';
+                        $view->result[$k]->field_field_line_1_price[0]['rendered']['#markup'] = '<span>$' .$discount['monthly_discount'] . '/month</span>' . $oldPrice;
+                        $full_url = $purchase_url . '/' . $discount['monthly_url'];
+                        $raw_price = $discount['monthly_discount'];
+                        $tracking_offer_code = $discount['offercode'];
+                    }else{
+                        $offercode = substr($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'],strpos($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'], 'Code=') + 5);
+                        $encrypted_offercode = urlsafe_base64_encode($offercode);
+                        $url_end = str_replace($offercode, $encrypted_offercode, $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                        $full_url = $purchase_url . '/' . $url_end;
+                        $raw_price = $view->result[$k]->field_field_line_1_price[0]['raw']['value'];
+                    }
+
+                }
+                elseif($r->node_title == 'Annual'){
+                    $mbox_label = 'data-conversionmbox="yearlyJpassConversion"';
+                    if(!empty($discount['yearly_discount'])){
+                        $oldPrice = '<span class="crossout">' . $view->result[$k]->field_field_line_1_price[0]['rendered']['#markup'] .'</span>';
+                        $view->result[$k]->field_field_line_1_price[0]['rendered']['#markup'] = '<span>$' .$discount['yearly_discount'] . '/year</span>' . $oldPrice;
+                        // $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'] = $purchase_url . '/' . $discount['yearly_url'];
+                        $full_url = make_purchase_url($discount['yearly_url'], $discount);
+                        $raw_price = $discount['yearly_discount'];
+                        $tracking_offer_code = $discount['offercode'];
+                    }else{
+                        $offercode = substr($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'],strpos($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'], 'Code=') + 5);
+                        $encrypted_offercode = urlsafe_base64_encode($offercode);
+                        $url_end = str_replace($offercode, $encrypted_offercode, $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                        //$url_parts = explode('=',$view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                        //$full_url = $purchase_url . '/' . $url_parts[0] . '=' . urlsafe_base64_encode($url_parts[1]);  // assumes url part[1] is the offer code
+                        $full_url = $purchase_url . '/' . $url_end;
+                        $raw_price = $view->result[$k]->field_field_line_1_price[0]['raw']['value'];
+                    }
+                }
+                // sanitize the price
+                $raw_price = str_replace(array('/month', '/year'), '', $raw_price);
+                if (substr($raw_price,0,1) !== '$') $raw_price = '$' . $raw_price;
+                /** data-products format
+                 * data-product="Product Name;Product code; Quantity;Price"
+                 **/
+                $html_link = '<a href="' . $full_url . '" class="button primary conversionClick" ' . $mbox_label . ' data-product="' . strtolower($r->node_title) . ';' . $tracking_offer_code . ';1;' . $raw_price .'">BUY</a>';
+                $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'] = $html_link;
+            }
+
+            // }
+        }else{
+            foreach($view->result as $k => $r){
+                $mbox_label = "";
+                if($r->node_title == 'Monthly'){
+                    $mbox_label = 'data-conversionmbox="monthlyJpassConversion"';
+                }
+                if($r->node_title == 'Annual'){
+                    $mbox_label = 'data-conversionmbox="yearlyJpassConversion"';
+                }
+                $offercode = substr($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'],strpos($view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'], 'Code=') + 5);
+                $encrypted_offercode = urlsafe_base64_encode($offercode);
+                $url_end = str_replace($offercode, $encrypted_offercode, $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                //$url_parts = explode('=',$view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup']);
+                //$full_url = $purchase_url . '/' . $url_parts[0] . '=' . urlsafe_base64_encode($url_parts[1]);  // assumes url part[1] is the offer code
+                $full_url = $purchase_url . '/' . $url_end;  // assumes url part[1] is the offer code
+                $raw_price = str_replace(array('/month', '/year'), '', $view->result[$k]->field_field_line_1_price[0]['raw']['value']);
+                if (substr($raw_price,0,1) !== '$') $raw_price = '$' . $raw_price;
+                $html_link = '<a href="' . $full_url . '" class="button primary conversionClick" ' . $mbox_label . ' data-product="' . strtolower($r->node_title) . ';' . $url_parts[1] . ';1;' . $raw_price .'">BUY</a>';
+                $view->result[$k]->field_field_select_button_links_to [0]['rendered']['#markup'] = $html_link;
+            }
+        }
+
+    }
+}
+
+function make_purchase_url($discounturl, $discount = null){
+    $purchase_url = variable_get('purchase_url');
+    if(empty($purchase_url)){
+        variable_set('purchase_url', 'http://jpass.jstor.org');
+        $purchase_url = variable_get('purchase_url');
+    }
+    $offerurl = compress_string($purchase_url . '/' . $discounturl);
+    global $base_url;
+    return  '/offer/' . $offerurl;
+}
+
+function discount_delete($id){
+    //query db to get machine name for this importer, so the field mapping fields to be deleted can be identified.
+
+    $query = db_delete('society_records')
+        ->condition('id',$id)
+        ->execute();
+    drupal_set_message('Discount has been removed from database');
+    drupal_goto('admin/structure/discounts/society-discounts');
+}
+
+function expiration_notification_form($form, &$form_state){
+
+    $form['expiration_emails'] = array(
+        '#title' => 'Alert these emails regarding expiring discounts (multiple addresses should be separated with commas, no spaces)',
+        '#type' => 'textfield',
+        '#default_value' => variable_get('expiration_emails', ''),
+    );
+    $form['days_prior'] = array(
+        '#title' => 'How many days prior to expiration should notifications be sent',
+        '#type' => 'textfield',
+        '#default_value' => variable_get('days_prior', ''),
+    );
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'Save Changes',
+    );
+    return $form;
+}
+
+function expiration_notification_form_submit($form, &$form_state){
+    $v = $form_state['values'];
+    variable_set('expiration_emails', $v['expiration_emails']);
+    variable_set('days_prior', $v['days_prior']);
+    drupal_goto('admin/structure/discounts/society-discounts');
+}
+
+function discounts_instance_form($form, &$form_state){
+    $id = $form_state['build_info']['args'][1];
+    $dbget = db_query("SELECT * FROM  society_records WHERE id = '{$id}'");
+    $dbresult = $dbget->fetchAll();
+
+    $form['id'] = array(
+        '#value' => $id,
+        '#type' => 'hidden',
+    );
+    $form['active'] = array(
+        '#type' => 'radios',
+        '#title' => 'Is Discount Active?',
+        '#options' => array('1' => 'Yes', '0' => 'No'),
+        '#default_value' => $dbresult[0]->active,
+    );
+
+    $form['society_name'] = array(
+        '#title' => 'Society Name',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->society_name,
+    );
+    $form['offercode'] = array(
+        '#title' => 'Offer Code',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->offercode,
+        '#access' => false,
+    );
+    $form['copy'] = array(
+        '#title' => 'Description',
+        '#type' => 'textarea',
+        '#default_value' => $dbresult[0]->copy,
+    );
+    $exdate = '';
+    if(!empty($dbresult[0]->expiration_date)){
+        $exdate = date('Y-m-d',$dbresult[0]->expiration_date);
+    }
+    $form['expiration_date'] = array(
+        '#title' => 'Discount Expires (YYYY-MM-DD) <em>Leave blank for no expiration </em>',
+        '#type' => 'textfield',
+
+        '#default_value' => $exdate,
+    );
+    $form['make_match_code'] = array(
+        '#title' => 'Generate new Match code (expiration date must be a future date)',
+        '#type' => 'checkbox',
+    );
+    $form['match_code'] = array(
+        '#value' => $dbresult[0]->match_code,
+        '#type' => 'hidden',
+    );
+
+
+    $form['monthly_url'] = array(
+        '#title' => 'Monthly Discount URL Param',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->monthly_url,
+    );
+    $form['monthly_discount'] = array(
+        '#title' => 'Monthly Discounted Amount (leave blank if none)(just dollar value, no dollar sign)',
+        '#size' => 20,
+        '#maxlength' => 20,
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->monthly_discount,
+
+    );
+    $form['yearly_url'] = array(
+        '#title' => 'Yearly Discount URL Param',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->yearly_url,
+    );
+
+    $form['yearly_discount'] = array(
+        '#title' => 'Yearly Discounted Amount (leave blank if none)(just dollar value, no dollar sign)',
+        '#size' => 20,
+        '#maxlength' => 20,
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->yearly_discount,
+
+    );
+    $form['threshold'] = array(
+        '#title' => 'Redemption Threshold',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->threshold,
+
+
+    );
+    $form['threshold_disable'] = array(
+        '#type' => 'radios',
+        '#title' => 'Disable discount if threshold exceeded',
+        '#options' => array('1' => 'Yes', '0' => 'No'),
+        '#default_value' => $dbresult[0]->threshold_disable,
+
+    );
+    $form['threshold_email'] = array(
+        '#title' => 'Alert this email address if threshold exceeded',
+        '#type' => 'textfield',
+        '#default_value' => $dbresult[0]->threshold_email,
+    );
+    $form['participant_type'] = array(
+        '#type' => 'select',
+        '#title' => t('Participant Type'),
+        '#options' => array(
+            'society' => 'Society',
+            'individual' => 'Individual',
+            'institution' => 'Institution',
+            'group' => 'Group',
+            '_' => 'No Type Selected',
+        ),
+        '#default_value' => $dbresult[0]->participant_type,
+    );
+
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'Save Changes',
+    );
+    return $form;
+
+}
+function discounts_instance_form_validate($form, &$form_state){
+    $v = $form_state['values'];
+    if($v['make_match_code']){
+        if(empty($v['expiration_date']) || $v['expiration_date'] == 'None'){
+            form_set_error('expiration_date', 'Cannot generate new expiration code without valid expiration date ');
+        }
+    }
+
+    if($v['make_match_code'] && strtotime($v['expiration_date']) < time()){
+        form_set_error('expiration_date', 'Expiration date for new match code cannot occur in the past.');
+    }
+
+
+}
+
+function society_discounts_form_validate($form, &$form_state){
+    $v = $form_state['values'];
+    if(!isset($v['society_id']) || empty($v['society_id'])){
+        form_set_error('society_id', 'Discount requires a society Code to work');
+    }else{
+        $society_id = $v['society_id'];
+        $dbget = db_query("SELECT * FROM society_records WHERE society_id='{$society_id}' AND active = '1'");
+        $res = $dbget->fetchAll();
+        if(!empty($res)){
+            form_set_error('society_id', 'There is already an active discount using the society Code "' . $society_id  . '", please use a different code');
+        }
+    }
+}
+
+function discounts_instance_form_submit($form, &$form_state){
+    $v = $form_state['values'];
+    $id = $v['id'];
+    $active = ($v['make_match_code'] ? '1': $v['active']);
+    $society_id = (isset($v['society_id']) ? trim($v['society_id']) : '');
+    $society_name = (isset($v['society_name']) ? trim($v['society_name']) : '');
+    $monthly_discount = (isset($v['monthly_discount']) ? trim($v['monthly_discount']) : '');
+    $yearly_discount = (isset($v['yearly_discount']) ? trim($v['yearly_discount']) : '');
+    $threshold = (isset($v['threshold']) ? trim($v['threshold']) : '');
+    $threshold_disable = (isset($v['threshold_disable']) ? trim($v['threshold_disable']) : '');
+    $threshold_email = (isset($v['threshold_email']) ? trim($v['threshold_email']) : '');
+    $monthly_url = (isset($v['monthly_url']) ? trim($v['monthly_url']) : '');
+    $yearly_url = (isset($v['yearly_url']) ? trim($v['yearly_url']) : '');
+    $offercode = ($yearly_url != '' ? substr($yearly_url,strpos($yearly_url, 'Code=') + 5) : '');
+    $copy = (isset($v['copy']) ? $v['copy'] : '');
+    $expiration_date = (isset($v['expiration_date']) ? strtotime($v['expiration_date']) : '');
+    $match_code = ($v['make_match_code'] ? generateRandomString() : $v['match_code']);
+    $participant_type = (isset($v['participant_type']) ? trim($v['participant_type']) : '_');
+    $result = db_query("UPDATE society_records SET active=:active, society_name=:society_name, monthly_discount=:monthly_discount,
+            yearly_discount=:yearly_discount,threshold=:threshold,threshold_disable=:threshold_disable,
+            threshold_email=:threshold_email,monthly_url=:monthly_url,yearly_url=:yearly_url,offercode=:offercode,
+            copy=:copy,expiration_date=:expiration_date,match_code=:match_code,participant_type=:participant_type WHERE id = :id",
+        array(
+            ':id' => $id , ':society_name' => $society_name, ':monthly_discount' => $monthly_discount, ':yearly_discount' => $yearly_discount,
+            ':threshold' => $threshold, ':threshold_disable' => $threshold_disable, ':threshold_email' => $threshold_email, ':monthly_url' => $monthly_url,
+            ':yearly_url' => $yearly_url, ':active' => $active, ':offercode' => $offercode, ':copy' => $copy, ':expiration_date' => $expiration_date,
+            ':match_code' => $match_code, ':participant_type' => strtolower($participant_type)
+        ));
+    drupal_set_message('Updated discount for ' . $society_name);
+    drupal_goto('admin/structure/discounts/society-discounts');
+
+}
+
+function society_discounts_form($form, &$form_state){
+
+    $form['force_cron'] = array(
+        '#markup' => 'Force cron to check for expired discounts ' .l('here', 'admin/config/system/cron/execute/society_discounts_cron'),
+    );
+
+    $form['add'] = array(
+        '#markup' => "<h4>Add Society Discount</h4>",
+    );
+
+
+    $form['society_name'] = array(
+        '#title' => 'Society Name',
+        '#type' => 'textfield',
+    );
+    $form['society_id'] = array(
+        '#title' => 'Society Code',
+        '#type' => 'textfield',
+    );
+    $form['offercode'] = array(
+        '#title' => 'Offer Code',
+        '#type' => 'textfield',
+        '#access' => false,
+
+    );
+    $form['copy'] = array(
+        '#title' => 'Description (the customized message displayed in the purchase area to discount-qualifying visitors)',
+        '#type' => 'textarea',
+        //'#description' => 'the customized message displayed in the purchase area to discount-qualifying visitors'
+
+    );
+    $form['expiration_date'] = array(
+        '#title' => 'Discount Expires (YYYY-MM-DD) <em>Leave blank for no expiration </em>',
+        '#type' => 'textfield',
+
+    );
+
+    $form['monthly_url'] = array(
+        '#title' => 'Monthly Discount Url Param (leave blank if none, url should begin with "action/" - not full URL)',
+        '#type' => 'textfield',
+    );
+    $form['monthly_discount'] = array(
+        '#title' => 'Monthly Discounted Amount (leave blank if none)',
+        '#size' => 20,
+        '#maxlength' => 20,
+        '#type' => 'textfield',
+
+
+    );
+    $form['yearly_url'] = array(
+        '#title' => 'Yearly Discount Url Param (leave blank if none, url should begin with "action/" - not full URL)',
+        '#type' => 'textfield',
+    );
+    $form['yearly_discount'] = array(
+        '#title' => 'Yearly Discounted Amount (leave blank if none)',
+        '#size' => 20,
+        '#maxlength' => 20,
+        '#type' => 'textfield',
+
+
+    );
+    $form['threshold'] = array(
+        '#title' => 'Redemption Threshold (How many discounts can be redeemed before alert is triggered. Set to 0 for no threshold)',
+        '#type' => 'textfield',
+        //'#description' => 'How many discounts can be redeemed before alert is triggered. Set to 0 for no threshold.',
+        '#default_value' => 0,
+
+    );
+    $form['threshold_disable'] = array(
+        '#type' => 'radios',
+        '#title' => 'Disable discount if threshold exceeded',
+        '#options' => array('1' => 'Yes', '0' => 'No'),
+        '#default_value' => 'no'
+
+    );
+    $form['threshold_email'] = array(
+        '#title' => 'Alert this email address if threshold exceeded (multiple addresses should be separated with commas, no spaces)',
+        '#type' => 'textfield',
+    );
+    $form['participant_type'] = array(
+        '#type' => 'select',
+        '#title' => t('Participant Type'),
+        '#options' => array(
+            'society' => 'Society',
+            'individual' => 'Individual',
+            'institution' => 'Institution',
+            'group' => 'Group',
+            '_' => 'No Type Selected',
+        ),
+        '#default_value' => '_',
+    );
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'Add Discount',
+    );
+
+    return $form;
+}
+
+function society_discounts_form_submit($form, &$form_state){
+
+
+
+    $v = $form_state['values'];
+    $society_id = (isset($v['society_id']) ? trim($v['society_id']) : '');
+    $society_name = (isset($v['society_name']) ? trim($v['society_name']) : '');
+    $monthly_discount = (isset($v['monthly_discount']) ? trim($v['monthly_discount']) : '');
+    $yearly_discount = (isset($v['yearly_discount']) ? trim($v['yearly_discount']) : '');
+    $threshold = (isset($v['threshold']) ? trim($v['threshold']) : '');
+    $threshold_disable = (isset($v['threshold_disable']) ? $v['threshold_disable'] : '');
+    $threshold_email = (isset($v['threshold_email']) ? $v['threshold_email'] : '');
+
+    $copy = (isset($v['copy']) ? $v['copy'] : '');
+    $expiration_date = (isset($v['expiration_date']) ? strtotime($v['expiration_date']) : '');
+    $match_code = generateRandomString();
+    $monthly_url = (isset($v['monthly_url']) ? trim($v['monthly_url']) : '');
+    $yearly_url = (isset($v['yearly_url']) ? trim($v['yearly_url']) : '');
+    $offercode = ($yearly_url != '' ? substr($yearly_url,strpos($yearly_url, 'Code=') + 5) : '');
+    $participant_type = (isset($v['participant_type']) ? trim($v['participant_type']) : '');
+
+    db_query("insert into society_records (society_id, society_name, monthly_discount, yearly_discount, threshold, threshold_disable, threshold_email, monthly_url, yearly_url,active, offercode,copy,expiration_date,match_code,participant_type)
+	   VALUES (:society_id, :society_name, :monthly_discount, :yearly_discount, :threshold, :threshold_disable, :threshold_email, :monthly_url, :yearly_url, :active, :offercode,:copy,:expiration_date,:match_code,:participant_type)",
+        array(
+            ':society_id' => $society_id, ':society_name' => $society_name, ':monthly_discount' => $monthly_discount, ':yearly_discount' => $yearly_discount,
+            ':threshold' => $threshold, ':threshold_disable' => $threshold_disable, ':threshold_email' => $threshold_email, ':monthly_url' => $monthly_url, ':yearly_url' => $yearly_url ,
+            ':active' => '1',':offercode' => $offercode,':copy' => $copy,':expiration_date' => $expiration_date, ':match_code' => $match_code,':participant_type' => strtolower($participant_type)
+        ));
+}
+
+function society_discounts_list_html($result){
+    $markup = '';
+    $options['attributes']['class'][] = 'discounts';
+    global $base_root;
+    foreach($result as $r){
+        $society_id = $r->society_id;
+        $society_name = $r->society_name;
+        $active = ($r->active == '1' ? 'Yes' : 'No' );
+        $monthly_discount = (!empty($r->monthly_discount) ? '$' . $r->monthly_discount  : 'None');
+        $yearly_discount = (!empty($r->yearly_discount) ? '$' . $r->yearly_discount : 'None');
+        $threshold = (!empty($r->threshold) ? $r->threshold : 'None');
+
+        $threshold_disable = ($r->active == '1' ? 'Yes' : 'No' );
+        $threshold_email =  (!empty($r->threshold_email) ? $r->threshold_email : 'None');
+        $monthly_url =  (!empty($r->monthly_url) ? $r->monthly_url : 'None');
+        $yearly_url = (!empty($r->yearly_url) ? $r->yearly_url : 'None');
+        $expiration_date = (!empty($r->expiration_date) ? date("F j, Y, g:i a", $r->expiration_date) : 'None');
+        $match_code = $r->match_code; //(!empty($r->match_code) ? date("F j, Y, g:i a", $r->expiration_date) : 'None');
+
+        if($expiration_date != 'None' && strtotime($expiration_date) < time()){
+            $society_name .= " <strong>(Expired)</strong>";
+        }
+
+        $markup .= "<h4> $society_name </h4>";
+        $markup .= "<em>" . $base_root . '/?soc=' . $society_id . '&mc=' . $match_code . '</em><br/>';
+        $markup .= '<ul style="display:inline;list-style-type:none">';
+        $markup .= '<li style="display:inline;border-right:1px solid black;">'. l("Edit  ", "/admin/structure/discounts/edit-discount/" . $r->id) . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;">&nbsp;  '. l("Delete  ", "delete-discount/" . $r->id) . ' &nbsp;</li></ul><br/>';
+        $markup .= '<ul style="display:inline;list-style-type:none">';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>ID: </strong>  '.  $society_id . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>Active: </strong>  '.  $active . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Monthly Discounted Price : </strong>  '.  $monthly_discount . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Yearly Discounted Price: </strong>  '.  $yearly_discount . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Discount Threshold: </strong>  '.  $threshold . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Discounts Redeemed: </strong>  '.  discounts_redeemed($r->id) . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Disable if Threshold Exceeded: </strong>  '.  $threshold_disable . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Email if Threshold Exceeded: </strong>  '.  $threshold_email . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Monthly URL Param: </strong>  '.  $monthly_url . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Yearly URL Param: </strong>  '.  $yearly_url . ' </li>';
+        $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Expiration Date: </strong>  '.  $expiration_date . ' </li>';
+        if($expiration_date != 'None'){
+            $markup .= '<li style="display:inline;border-right:1px solid black;"><strong>&nbsp; Discount Match Code: </strong>  '.  $r->match_code . ' </li>';
+        }
+        $markup .= "</ul><br/>";
+    }
+    $markup .= '<hr/>';
+    return $markup;
+}
+
+function discounts_redeemed($id){
+    $dbget = db_query("SELECT * FROM  society_redemptions WHERE society = '{$id}'");
+    return $dbget->rowCount();
+}
+
+function generateRandomString($length = 10) {
+    $characters = '0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ';
+    $randomString = '';
+    for ($i = 0; $i < $length; $i++) {
+        $randomString .= $characters[rand(0, strlen($characters) - 1)];
+    }
+    return $randomString;
+}
+
+function society_discounts_cron(){
+    $days_prior = variable_get('days_prior', '0');
+    $expire_notify = time() + ($days_prior * 86400);
+    $dbget = db_query("SELECT * FROM  society_records");
+    $dbresult = $dbget->fetchAll();
+    $expire_participants = array();
+    foreach($dbresult as $res){
+        if(isset($res->threshold)){
+            if($res->threshold > 0){
+                $getCount = db_query("SELECT * FROM  society_redemptions WHERE society = '{$res->id}'");
+                $count = $getCount->rowCount();
+                if($count >= $res->threshold && $res->active == '1' && $res->threshold_disable == '1'){
+                    $result = db_query("UPDATE society_records SET active=:active WHERE id = :id",
+                        array(':active' => '0',':id' => $res->id ,)
+                    );
+                    if(!empty($res->threshold_email)){
+                        threshold_notify($res, $count);
+                    }
+                }
+            }
+        }
+
+
+        if(!empty($res->expiration_date)){
+            if($days_prior != '0'  && $res->exp_notification_sent == '0'){
+                if($expire_notify >= $res->expiration_date && $res->active == '1'){
+                    $expire_participants[] = array('society_name' => $res->society_name, 'id' => $res->id, 'expiration_date' => date("F d, Y", $res->expiration_date));
+                }
+            }
+
+            if($res->expiration_date < time() && $res->active == '1'){
+                $result = db_query("UPDATE society_records SET active=:active WHERE id = :id",
+                    array(':active' => '0',':id' => $res->id ,)
+                );
+            }
+        }
+    }
+    if(!empty($expire_participants)){
+        expire_notify($expire_participants);
+    }
+}
+
+function expire_notify($expire_participants){
+    $to = variable_get('expiration_emails');
+    $subject = "JPASS Discount Expiration Notice";
+    $message = "The following discounts will be expiring soon\n";
+    foreach($expire_participants as $e){
+        $message .= $e['society_name'] . " -- " . $e['expiration_date'] . "\n";
+        $result = db_query("UPDATE society_records SET exp_notification_sent=:exp_notification_sent WHERE id = :id",
+            array(':exp_notification_sent' => '1',':id' => $e['id'] )
+        );
+    }
+    $headers = 'From: jpass@jstor.org';
+    mail($to,$subject,$message, $headers);
+}
+
+function threshold_notify($res, $count){
+    $threshold = $res->threshold;
+    $to = $res->threshold_email;
+    $society_name = $res->society_name;
+
+
+    $subject =   $society_name . ' redemption limit exceeded ' . date("d/m/Y H:i", time()) ;
+    $message = "Your member threshold has been exceeded. There have been $count visitors to the JPASS website from your organization. ";
+    $message .=  "The discount is now inactive. Please contact jpass@jstor.org for a new discount.";
+    $headers = 'From: jpass@jstor.org';
+    mail($to,$subject,$message, $headers);
+}
+
+function compress_string($string) {
+    return urlsafe_base64_encode(gzcompress($string, 9));
+}
+
+function decompress_string($string) {
+    return gzuncompress(urlsafe_base64_decode($string));
+}
+
+function urlsafe_base64_encode($string) {
+    $data = base64_encode($string);
+    $data = str_replace(array('+','/','='),array('-','_',''),$data);
+    return $data;
+}
+
+function urlsafe_base64_decode($string) {
+    $data = str_replace(array('-','_'),array('+','/'),$string);
+    $mod4 = strlen($data) % 4;
+    if ($mod4) {
+        $data .= substr('====', $mod4);
+    }
+    return base64_decode($data);
+}

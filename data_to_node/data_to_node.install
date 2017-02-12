@@ -1,0 +1,137 @@
+<?php
+/*
+function data_to_node_install(){
+	drupal_install_schema('data_to_node');
+	_data_to_node_default_insert();
+	
+
+}
+ * */
+ 
+
+function data_to_node_schema(){
+	$schema['content_importers'] = array(
+		'description' => 'Maintains a Node Import Counter',
+		'fields' => array(
+			'id' => array(
+	            'description' => 'The primary identifier.',
+	            'type' => 'serial',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+	        'name' => array(
+	            'description' => 'Full Name',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	'machine_name' => array(
+	            'description' => 'Machine Name',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	'file_or_url' => array(
+	            'description' => 'File or URL',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+			//##change to enum
+			
+        	'path' => array(
+	            'description' => 'Path to Data',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	//## either enforce limit and require url shortener, or make accomodate more chars
+        	'num_subsets' => array(
+	            'description' => 'Number of Subsets',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+	        'last_subset_checked' => array(
+	            'description' => 'Last Subset Checked',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	            'default'	=> 1,
+	        ),
+	        'data_format' => array(
+	            'description' => 'Data Format',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	//##change this to enum
+        	'node_type' => array(
+	            'description' => 'Content Type',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	'xpath' => array(
+	            'description' => 'xpath root',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+	        //##Add date created and date last run
+	    ),    
+	    'primary key' => array('id'),
+	);
+	$schema['content_importers_field_mapping'] = array(
+		'fields' => array(
+			'id' => array(
+	            'description' => 'The primary identifier.',
+	            'type' => 'serial',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+	        'name' => array(
+	            'description' => 'Full Name',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	 'importer_machine_name' => array(
+	            'description' => 'Machine Name',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	 'importer_field' => array(
+	            'description' => 'Field to be read',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	 'importer_destination' => array(
+	            'description' => 'Field to be written to',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	
+	        
+	    ),    
+	    'primary key' => array('id'),
+	);
+	return $schema;	
+}
+//SHOULD ADD THI
+function data_to_node_enable(){
+	if(db_table_exists('field_revision_field_title_list_coverage_notes') && db_table_exists('field_data_field_title_list_coverage_notes')){
+		db_query("ALTER TABLE  {field_data_field_title_list_coverage_notes} CHANGE  field_title_list_coverage_notes_value  field_title_list_coverage_notes_value VARCHAR( 512 ) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL");	
+		db_query("ALTER TABLE  {field_revision_field_title_list_coverage_notes} CHANGE  field_title_list_coverage_notes_value  field_title_list_coverage_notes_value VARCHAR( 512 ) CHARACTER SET utf8 COLLATE utf8_general_ci NULL DEFAULT NULL");
+	}
+}
+
+//
+/*
+function _data_to_node_default_insert(){
+	db_query("INSERT INTO {archival_import_counter} (last_import_subset) VALUES (:num)", array(':num' => '1'));
+}
+*/

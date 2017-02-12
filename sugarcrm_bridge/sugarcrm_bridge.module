@@ -1,0 +1,102 @@
+<?php
+
+/*
+ * Sugarcrm Bridge is responsible for connecting Drupal to the Spinegar SugarCRM Library
+ * This makes the the Library available to any other module in Drupal. The Module that
+ * commonly uses it is sugar_submitting, which is home to the form submit handlers that write to sugar.
+ */
+
+function sugarcrm_bridge_menu() {
+    $items['admin/config/services/sugarcrm-bridge'] = array(
+        'title' => 'SugarCRM/Act-on bridge',
+        'page callback' => 'drupal_get_form',
+        'page arguments' => array('sugarcrm_bridge_form'),
+        'access callback' => 'user_is_logged_in',
+        'type' => MENU_NORMAL_ITEM,
+        'description' => t('SugarCRM and Act-On bridge settings'),
+        'weight' => 10,
+        'file' => 'sugarcrm_bridge.admin.inc',
+    );
+
+    return $items;
+}
+
+/*
+ * returns an object that can be used to get & send data to a SugarCRM instance
+ */
+
+function sugar_initialize(){
+
+    # get variable settings that are entered using the form defined in the file sugarcrm_bridge.admin.inc
+    $url = variable_get('sugar_test_url', '');
+    $port = variable_get('sugar_port', '');
+    $username = variable_get('sugar_username', '');
+    $password = variable_get('sugar_password', '');
+
+    #test or prod?
+    if(isset($_SERVER['SGK_ENVIRONMENT']) &&  $_SERVER['SGK_ENVIRONMENT'] == 'prod'){
+        $url = variable_get('sugar_url', '');
+    }
+
+    /**
+     * The Spinegar Library errors out in a way that visitors to the site would see the error
+     * if it failed. Before attempting to initialze the library, we will make a CURL call using
+     * the same credentials to confirm they work before sending it to the library.
+     */
+    $curl = curl_init($url . "oauth2/token");
+    curl_setopt($curl, CURLOPT_POST, true);
+    curl_setopt($curl, CURLOPT_HEADER, false);
+    curl_setopt($curl, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($curl, CURLOPT_PORT, $port);
+
+    # Set the POST arguments to pass to the Sugar server
+    $rawPOSTdata = array(
+        "grant_type" => "password",
+        "username" => $username,
+        "password" => $password,
+        "client_id" => "sugar",
+        "client_secret"=>"",
+    );
+    curl_setopt($curl, CURLOPT_POSTFIELDS, json_encode($rawPOSTdata));
+    curl_setopt($curl, CURLOPT_HTTPHEADER, array('Content-Type: application/json'));
+
+    # Make the REST call, returning the result
+    $response = curl_exec($curl);
+
+    $response_object = json_decode($response);
+
+    if(isset($response_object->error)){
+        global $user;
+        if ( $user->uid ) {
+            drupal_set_message($response_object->error_message);
+        }
+        return false;
+    }
+
+    # we only get this far if the test call to sugar had no errors, so proceed intiializing the Sugar Library
+
+    require_once __DIR__ . '/vendor/autoload.php';
+
+    $sugar = new \Spinegar\Sugar7Wrapper\Rest();
+
+    try{
+        $sugar->setUrl($url)
+          ->setUsername($username)
+          ->setPassword($password)
+          ->connect();
+    }catch(Exception $e){
+        watchdog( 'Sugar Init Problem' , $e->getMessage());
+        return false;
+
+    }
+
+    return $sugar;
+}
+
+function check_empty(&$var, $default = "") {
+    if (empty($var)) {
+        return  $default;
+    }else{
+        return $var;
+    }
+}

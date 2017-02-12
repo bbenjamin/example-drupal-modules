@@ -1,0 +1,319 @@
+<?php
+
+define("ZDAPIKEY", "****");
+define("ZDUSER", "****");
+define("ZDURL", "****");
+
+function zendesk_support_menu() {
+
+	$items['zentest'] = array(
+		'page callback' => 'zen_test',
+		'access callback' => 'user_is_logged_in',
+		'title' => 'Zen Test',
+		'type' => MENU_CALLBACK,
+	);
+	return $items;
+}
+
+/*
+ * only active on prod - cron checks for new tickets in Zendesk and checks the submitter email address
+ * and creates/updates contacts in Sugar accordingly
+ */
+function sync_zen_contacts_to_sugar(){
+    $last_checked = variable_get('last_checked_zendesk',date('c'));
+	$interval = time() - strtotime($last_checked);
+	$search = json_encode(
+		array(
+			'query' => "type:ticket created>" . $last_checked
+
+		),JSON_FORCE_OBJECT
+	);
+	$result = zenCurl('/search.json', $search, "GET");
+	$sugar = sugar_initialize();
+	if(!$sugar){
+		watchdog('sugar not initializing','not good',WATCHDOG_ALERT);
+	}
+
+	foreach($result->results as $r){
+		$usr = zenCurl('/users/' . $r->requester_id .'.json', null, "GET");
+		$email = $usr->user->email;
+		$contacts = _get_contact($sugar, $email);
+
+
+		if(empty($contacts['records'])){
+			$name = $usr->user->name;
+			$name = explode(" ",$name ,2);
+			$first_name = $name[0];
+			$last_name = isset($name[1]) ? $name[1] : "";
+			$contact = $sugar->create('Contacts', array(
+				'first_name' => $first_name,
+				'last_name' => $last_name,
+				'email' => array(array('email_address' => $email, 'primary_address' => '1')),
+			));
+			$sugar->create('ITH_API_Audit_History', array(
+				'name' => 'Zendesk ' . $contact['first_name'] . ' ' . $contact['last_name'] . ' Created',
+				'description' => 'Created from Zendesk Contact',
+				'api_source' => 'WebForm',
+				'action' => 'Create',
+				'apiaudit_type' => 'Drupal',
+				'url' => 'zendesk',
+				'sugar_id' => $contact['id'],
+				'ith_api_audit_history_contactscontacts_ida' => $contact['id'],
+				'ith_api_audit_history_accounts_name' => $contact['first_name'] . ' ' . $contact['last_name'] ,
+			));
+
+		}else{
+			$contact = $contacts['records'][0];
+			if(time() - strtotime($contact['date_modified']) > $interval){
+				$sugar->create('ITH_API_Audit_History', array(
+					'name' => 'Zendesk ' . $contact['first_name'] . ' ' . $contact['last_name'] . ' Interaction',
+					'description' => 'This Contact Submitted an issue directly to Zendesk - there will be no corresponding sugar case ',
+					'api_source' => 'WebForm',
+					'action' => 'Update',
+					'apiaudit_type' => 'Drupal',
+					'url' => 'zendesk',
+					'sugar_id' => $contact['id'],
+					'ith_api_audit_history_contactscontacts_ida' => $contact['id'],
+					'ith_api_audit_history_accounts_name' => $contact['first_name'] . ' ' . $contact['last_name'] ,
+				));
+			}
+			$sugar->update('Contacts', $contact['id'], array()); //just to update "last updated" timestamp
+
+		}
+	}
+	variable_set('last_checked_zendesk',date('c'));
+
+}
+
+function zendesk_support_form_alter(&$form, &$form_state, $form_id) {
+
+	/*
+	 * Add Zendesk options to webform config
+	 */
+	if ($form_id == 'webform_components_form') {
+		$nid = isset( $form['nid']['#value'] ) ? $form['nid']['#value'] : "";
+
+		$form['zendesk'] = array(
+			'#type' => 'fieldset',
+			'#title' => t("Zendesk"),
+			'#weight' => 1,
+			'#attributes' => array('style' => 'background-color:#EEE;'),
+		);
+
+		$form['zendesk']['send_to_zendesk'] = array(
+			'#type' =>
+				'checkbox',
+
+			'#title' => t('Send to zendesk'),
+			'#weight' => 3,
+			'#default_value' => variable_get('send_to_zendesk_' . $nid, 0),
+			'#description' => t('Send submissions to zendesk. Will make best attempt to automatically map based on field names. If mapping does not work, create custom code in zendesk_support.module, in the send_this_to_zendesk function
+			 (this will also create a sugar case - custom code required to add zendesk category to sugar case).'),
+		);
+
+		$form['zendesk']['zendesk_group'] = array(
+			'#type' =>
+				'select',
+			'#title' => t('Zendesk Group'),
+			'#weight' => 5,
+			'#default_value' => variable_get('zendesk_group_' . $nid, 'none'),
+			'#options' => variable_get('zendesk_group', array()),
+		);
+		$form['zendesk']['message'] = array(
+			'#markup' => 'Don\'t see the groups you need? Pull the latest values from Zendesk by clicking <a href="http://forms.localhost/forms/admin/config/system/cron/execute/zendesk_support_cron">here</a>'
+		);
+
+		$form['#submit'][] = 'zendesk_support_component_submit';
+	}
+
+	/*
+	 * If a webform has zendesk enabled, attach it to the zendesk submit handler.
+	 */
+	if (strpos($form_id, 'webform_client_form') !== FALSE) {
+		$nid = isset($form['#node']->nid) ? $form['#node']->nid : "";
+		if (variable_get('send_to_zendesk_' . $nid, 0) == 1){
+			$form['#submit'][] = 'send_this_to_zendesk';
+		}
+	}
+
+}
+
+/*
+ * Save zendesk configuration for a webform
+ */
+function zendesk_support_component_submit($form, &$form_state){
+	$nid = isset( $form['nid']['#value'] ) ? $form['nid']['#value'] : "";
+	variable_set('send_to_zendesk_' . $nid, $form_state['values']['zendesk']['send_to_zendesk']);
+	variable_set('zendesk_group_' . $nid, $form_state['values']['zendesk']['zendesk_group']);
+}
+
+/*
+ * if zendesk is enabled on a form, the sumbmission data is routed through this function
+ */
+function send_this_to_zendesk($form, &$form_state){
+
+
+	$nid = isset( $form['#node']->nid ) ? $form['#node']->nid : "";
+	$group = variable_get('zendesk_group_' . $nid, '');
+	$category = $form['#node']->title;
+	/*
+	 * In this section we create default values based on educated guesses regarding the fields names - this may not be correct all the time!
+	 * If things are not mapped correctly, add a conditional within this function based on $nid to override these values
+	 */
+    // START Making guesses based on field names
+	$first_name = isset($form_state['input']['submitted']['first_name']) ? $form_state['input']['submitted']['first_name'] : '';
+	$last_name = isset($form_state['input']['submitted']['last_name']) ? $form_state['input']['submitted']['last_name'] : '';
+	$name = isset($form_state['input']['submitted']['name']) ? $form_state['input']['submitted']['name'] : '';
+	$email = 'none@ithaka.org';
+	$topic = '';
+	$subject = 'From: ' . $form['#node']->title;
+	$description = '';
+
+	if( !empty($first_name) && !empty($last_name) ){
+		$name = $first_name . ' ' . $last_name;
+	}
+	if(!empty($form_state['input']['submitted']['courtesy_title'])){
+		$name = $form_state['input']['submitted']['courtesy_title'] . ' ' . $name;
+	}
+
+	foreach($form_state['input']['submitted'] as $k => $v){
+		if(strpos($k, 'email') !== false){
+			$email = $form_state['input']['submitted'][$k];
+		}
+		if(strpos($k, 'subject') !== false){
+			$subject = $form_state['input']['submitted'][$k];
+		}
+		if(strpos($k, 'topic') !== false){
+			$topic = $form_state['input']['submitted'][$k];
+			if(isset($form['submitted'][$k]['#type']) && $form['submitted']['topic']['#type'] == 'select' ){
+				$topic = !empty($form['submitted'][$k]['#options'][$topic]) ? $form['submitted'][$k]['#options'][$topic] : '';
+			}
+		}
+		if(strpos($k, 'descri') !== false || strpos($k, 'comment') !== false ) {
+			$description = $form_state['input']['submitted'][$k];
+		}
+	}
+
+	if(!empty($topic) ){
+		$subject = $topic . ": " . $subject;
+	}
+
+
+	//END of making guesses based on field names
+
+	$arr = array(
+		"new_req_name" => $name,            //required
+		"new_req_email" => $email,          //required
+		"new_tick_group" => $group,         //optional
+		"new_tick_subj" => $subject,        //required
+		"new_tick_desc" => $description,    //required
+		"new_tick_cat" => $category         //optional
+	);
+
+	/*
+	 * DEFAULT ARRAY HAS BEEN MADE, IF THE DEFAULTS DO NOT WORK, ADD YOUR NID-BASED-CONDITIONALS HERE,
+	 * BEFORE THE $create VARIABLE IS CREATED
+	 *
+	 * example:
+	 * if( $form_id == 'webform_client_form_88' ){
+	 *     $arr["new_tick_desc"] = $form_state['input']['submitted']['some_other_field'];
+	 * }
+	 */
+
+
+
+
+	/*
+	 * Create the JSON to create the ticket - If you haven't overriden the defaults by now, you're stuck with the defaults!
+	 */
+
+	$create = json_encode(
+		array(
+			'ticket' => array(
+				'requester' => array(
+					'name' => $arr['new_req_name'],
+					'email' => $arr['new_req_email']
+				),
+				'group_id' => $arr['new_tick_group'],
+				'subject' => $arr['new_tick_subj'],
+				'description' => $arr['new_tick_desc'],
+				'custom_fields' => array(
+					'id' => 36183348,
+					'value' => $arr['new_tick_cat']
+				)
+			)
+		),
+		JSON_FORCE_OBJECT
+	);
+
+	zenCurl('/tickets.json', $create, "POST");
+
+}
+
+/*
+ * Periodically checks zendesk for current group list
+ */
+function zendesk_support_cron(){
+	$groups_result = zenCurl('/groups.json', null, "GET");
+
+    foreach($groups_result->groups as $v){
+	    $groups[$v->id] = $v->name;
+    }
+
+	$groups['none'] = 'None';
+	variable_set('zendesk_group', $groups);
+
+	if (isset($_SERVER['SGK_ENVIRONMENT']) && $_SERVER['SGK_ENVIRONMENT'] == 'prod' && strpos($_SERVER['CONTEXT_DOCUMENT_ROOT'], '/var/www/bsys-drupal-forms') !== false){
+		watchdog('zendesk sync', 'zendesk sync triggered');
+		sync_zen_contacts_to_sugar();
+	}
+
+}
+
+
+/*
+ * Populate group list when module is enabled
+ */
+function zendesk_support_enable(){
+	zendesk_support_cron();
+}
+
+
+function zenCurl($url, $json, $action)
+{
+	$ch = curl_init();
+	curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
+	curl_setopt($ch, CURLOPT_MAXREDIRS, 10 );
+	curl_setopt($ch, CURLOPT_URL, ZDURL.$url);
+	curl_setopt($ch, CURLOPT_USERPWD, ZDUSER."/token:".ZDAPIKEY);
+	switch($action){
+		case "POST":
+			curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "POST");
+			curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+			break;
+		case "GET":
+			curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "GET");
+			if(!is_null($json)){
+				curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+			}
+			break;
+		case "PUT":
+			curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "PUT");
+			curl_setopt($ch, CURLOPT_POSTFIELDS, $json);
+			break;
+		case "DELETE":
+			curl_setopt($ch, CURLOPT_CUSTOMREQUEST, "DELETE");
+			break;
+		default:
+			break;
+	}
+
+	curl_setopt($ch, CURLOPT_HTTPHEADER, array('Content-type: application/json'));
+	curl_setopt($ch, CURLOPT_USERAGENT, "MozillaXYZ/1.0");
+	curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+	curl_setopt($ch, CURLOPT_TIMEOUT, 10);
+	$output = curl_exec($ch);
+	curl_close($ch);
+	$decoded = json_decode($output);
+	return $decoded;
+}

@@ -1,0 +1,681 @@
+<?php
+/**
+ *  Implements hook_menu()
+ */
+function jstor_subscribers_menu() {
+    #This URL triggers the import of the subscriber list and generates a new table
+    $items['makesubscribers'] = array(
+      'access callback' => 'user_is_logged_in',
+      'page callback' => '_create_table_from_data',
+      'title'=> 'Getting Subscriber Data!'
+    );
+    #This is the URL the subscriber table is displayed on
+    $items['current-subscribers'] = array(
+      'page callback' => '_list_institutions',
+      'access callback' => TRUE,
+      'title'=> 'JSTOR Institutions'
+    );
+    #this is the url the IE only table is displayed on
+    $items['ie-subscriber-list'] = array(
+      'page callback' => '_list_ie_data',
+      'access callback' => TRUE,
+      'title'=> 'JSTOR Institutions'
+    );
+    #this generated the ie only table
+    $items['generate-ie-subscriber-list'] = array(
+      'page callback' => '_data_for_ie',
+      'access callback' => 'user_is_logged_in',
+      'title'=> 'JSTOR Institutions'
+    );
+
+   #just show a nice dsm() of the cached subscriber list for troubleshooting
+    $items['sugar-subscriber-list'] = array(
+        'page callback' => '_sugar_subscriber_list',
+        'access callback' => 'user_is_logged_in',
+        'title'=> 'Sugar Subscribeys',
+    );
+
+    return $items;
+}
+
+/*
+ * Using a global array to collect the list of subscribers over multiple calls.
+ */
+$globalsubscriberarray = array();
+
+
+
+/*
+ * just show me a krumo'd array of the cached subscriber list
+ */
+
+function _sugar_subscriber_list(){
+  dsm(variable_get('sugar_subscribers', array('empty' => 'sorry')));
+  return "all done";
+}
+
+function natksort(&$array) {
+  $keys = array_keys($array);
+  natcasesort($keys);
+  //TODO: change to array_map
+  foreach ($keys as $k) {
+    $new_array[$k] = $array[$k];
+  }
+
+  $array = $new_array;
+  return true;
+}
+
+/*
+ * implements hook_cron
+ * when the subscribers build queue is empty, it builds a new one
+ */
+
+function jstor_subscribers_cron(){
+
+  db_delete('queue')
+      ->condition('name', 'sugar_subscribers')
+      ->execute();
+
+
+  $queue = DrupalQueue::get('sugar_subscribers');
+
+  if($queue->numberOfItems() < 1){
+    # create prefixes to make queries a managable size
+    # creates array with aa, ab, ac etc. plus special characters
+    $subscriber_prefix_array = array();
+    foreach(range('a','z') as $first){
+      foreach(range('a','z') as $second){
+        array_push($subscriber_prefix_array, $first . $second);
+      }
+    }
+    # save prefix array as site variable so it can be referenced by other functions
+    $subscriber_prefix_array = array_merge($subscriber_prefix_array,array_merge( range(0,9), array("(","!","[")   ));
+    variable_set('subscriber_prefix_array', $subscriber_prefix_array);
+
+    #reset temp table as a new one is being built
+    $table_data = serialize(array());
+    file_put_contents(drupal_realpath('public://') . '/temp_subscribers_table.txt', $table_data);
+    watchdog('creating new queue', 'creating');
+
+    # queue queries for each prefix in the array
+    foreach ($subscriber_prefix_array as $item) {
+      $queue->createItem(array($item));
+    }
+  }
+}
+
+/*
+ * implements hook_cron_info
+ * registers what should be done with queued operations
+ * everytime cron is run, it will send queued imports through the worker callback function for the
+ * number of seconds specified in 'time' this gradually builds a new subscriber table.
+ */
+
+function jstor_subscribers_cron_queue_info() {
+
+  return array(
+      'sugar_subscribers' => array(
+          'worker callback' => 'get_sugar_subscribers_runner',
+          'time' => 40,
+          'skip on cron' => true,
+      ),
+  );
+}
+
+
+
+/*
+ *  This is a looped function that queries sugar and collects the results
+ */
+
+function _sub_loop_for_cron($sugar, $firstletter, $offset = 0){
+  global $globalsubscriberarray;
+
+  #Query Sugar with User Services filter criteria
+
+  $subscribers = $sugar->filter('Accounts', array(
+      'filter' => array(
+          array('if_publish_to_jstor_website_c' => array('$equals' => true)),
+          array('accounts_ith_serviceproducts_1.name' => array('$not_equals' => 'S_R')),
+          array('accounts_ith_serviceproducts_1.name' => array('$not_equals' => 'Portico')),
+          array('$or' => array(
+              array('accounts_ith_serviceproducts_1.particip_status_c' => array('$equals' => 'Participant')),
+              array('accounts_ith_serviceproducts_1.particip_status_c' => array('$equals' => 'Sibling')))
+          ),
+
+         array('name' => array('$starts' => $firstletter))
+      ),
+      'max_num' => 100,
+      'offset' => $offset,
+      'fields' => "name,if_publish_to_jstor_website_c,if_promotional_name_english_c,web_publishing_c,state_list_c,if_postal_code_c,if_country_c,country_list_c,if_community_c,if_institution_finder_url_c,if_iso_3166_1_alpha_2_c,if_iso_3166_1_alpha_3_c,promotional_name_foreign_c,promotional_name_acronym_c,master_site_id_c,date_entered",
+  ));
+
+  #merge the records just grabbed to the global array holding everything collected so far during this operation
+  $globalsubscriberarray = array_merge($globalsubscriberarray, $subscribers['records']);
+
+  #Return offset to continue the while loop that is calling this function
+  if($subscribers['next_offset'] ){
+    return $subscribers['next_offset'];
+  }
+
+  return false;
+
+}
+
+/*
+ * this is the function triggered by Drupals operation queue
+ * It accepts one paramter - the beginning characters of the account names we want to query for
+ * (get me accounts that begin with 'Ci', etc
+ */
+
+function get_sugar_subscribers_runner($chars){
+
+  # reset the global array for a nrew collection of account data
+  global $globalsubscriberarray;
+  $globalsubscriberarray = array();
+
+  $sugar = sugar_initialize();
+
+  # this will add items to $globalsubscribersarray until there are no more results
+  foreach($chars as $char){
+    $offset = _sub_loop_for_cron($sugar,$char);
+    while($offset && $offset >= 0){
+      $offset = _sub_loop_for_cron($sugar,$char,$offset);
+      if($offset == 0){
+        break;
+      }
+    }
+  }
+
+  # grab the temp table (AKA table-in-progress) and merge it with the data just collected
+
+  $table_data = file_get_contents(drupal_realpath('public://') . '/temp_subscribers_table.txt');
+  $temp_subscribers_table = unserialize($table_data);
+
+
+  $table_data = serialize(array_merge($temp_subscribers_table,$globalsubscriberarray));
+  file_put_contents(drupal_realpath('public://') . '/temp_subscribers_table.txt', $table_data);
+
+
+  # Get the array of prefixes we query sugar for to see if this is the last one in the list
+  $subscriber_prefix_array = variable_get('subscriber_prefix_array');
+  $last = array_pop($subscriber_prefix_array);
+  # if it is the last one in the list, then rebuild the cached tables by copying temp to the active one
+  if($chars[0] == '[' || $chars[0] == $last){
+
+    db_delete('queue')
+        ->condition('name', 'sugar_subscribers')
+        ->execute();
+    $table_data = file_get_contents(drupal_realpath('public://') . '/temp_subscribers_table.txt');
+    $temp_subscribers_table = unserialize($table_data);
+    watchdog('makin tables', "LAST:" . $last . " TEMP LENGTH: " . count($temp_subscribers_table) . " SUGAR LENGTH: " . count($globalsubscriberarray));
+   // variable_set('sugar_subscribers',array_merge($temp_subscribers_table));
+
+    //$table_data = serialize($temp_subscribers_table);
+    file_put_contents(drupal_realpath('public://') . '/sugar_subscribers.txt', $table_data);
+
+    #These trigger building of new tables based on the data collected.
+    _data_for_ie();
+    _create_table_from_data();
+
+  }
+
+
+  return true;
+}
+
+
+
+/*
+ * Function that takes the results of sugar queries and turns it into an html table that is cached and
+ * used as the markup seen on the Jstor subscribers page
+ */
+
+function _create_table_from_data(){
+
+
+  /*
+   * This array is required because Sugar returns the machine names of countries, and we need the Display Name
+   */
+  $country_keys = array (  "Afghanistan" =>"Afghanistan"  ,"Aland_Islands" =>"Aland Islands"  ,"Albania" =>"Albania"  ,"Algeria" =>"Algeria"  ,"American_Samoa" =>"American Samoa"  ,"Andorra" =>"Andorra"  ,"Angola" =>"Angola"  ,"Anguilla" =>"Anguilla"  ,"Antarctica" =>"Antarctica"  ,"Antigua_and_Barbuda" =>"Antigua and Barbuda"  ,"Argentina" =>"Argentina"  ,"Armenia" =>"Armenia"  ,"Aruba" =>"Aruba"  ,"Australia" =>"Australia"  ,"Austria" =>"Austria"  ,"Azerbaijan" =>"Azerbaijan"  ,"Bahamas" =>"Bahamas"  ,"Bahrain" =>"Bahrain"  ,"Bangladesh" =>"Bangladesh"  ,"Barbados" =>"Barbados"  ,"Belarus" =>"Belarus"  ,"Belgium" =>"Belgium"  ,"Belize" =>"Belize"  ,"Benin" =>"Benin"  ,"Bermuda" =>"Bermuda"  ,"Bhutan" =>"Bhutan"  ,"Bolivia_Plurinational_State_Of" =>"Bolivia, Plurinational State Of"  ,"Bonaire_Sint_Eustatius_And_Saba" =>"Bonaire, Sint Eustatius And Saba"  ,"Bosnia_and_Herzegovina" =>"Bosnia and Herzegovina"  ,"Botswana" =>"Botswana"  ,"Bouvet_Island" =>"Bouvet Island"  ,"Brazil" =>"Brazil"  ,"British_Indian_Ocean_Territory" =>"British Indian Ocean Territory"  ,"Brunei_Darussalam" =>"Brunei Darussalam"  ,"Bulgaria" =>"Bulgaria"  ,"Burkina_Faso" =>"Burkina Faso"  ,"Burundi" =>"Burundi"  ,"Cambodia" =>"Cambodia"  ,"Cameroon" =>"Cameroon"  ,"Canada" =>"Canada"  ,"Cape_Verde" =>"Cape Verde"  ,"Cayman_Islands" =>"Cayman Islands"  ,"Central_African_Republic" =>"Central African Republic"  ,"Chad" =>"Chad"  ,"Chile" =>"Chile"  ,"China" =>"China"  ,"Christmas_Island" =>"Christmas Island"  ,"Cocos__Keeling__Islands" =>"Cocos (Keeling) Islands"  ,"Colombia" =>"Colombia"  ,"Comoros" =>"Comoros"  ,"Congo" =>"Congo"  ,"Congo_The_Democratic_Republic_of_the" =>"Congo, The Democratic Republic of the"  ,"Cook_Islands" =>"Cook Islands"  ,"Costa_Rica" =>"Costa Rica"  ,"Cote_dIvoire" =>"Cote d'Ivoire"  ,"Croatia" =>"Croatia"  ,"Cuba" =>"Cuba"  ,"Cura\u00e7ao" =>"Cura\u00e7ao"  ,"Cyprus" =>"Cyprus"  ,"Czech_Republic" =>"Czech Republic"  ,"Denmark" =>"Denmark"  ,"Djibouti" =>"Djibouti"  ,"Dominica" =>"Dominica"  ,"Dominican_Republic" =>"Dominican Republic"  ,"Ecuador" =>"Ecuador"  ,"Egypt" =>"Egypt"  ,"El_Salvador" =>"El Salvador"  ,"Equatorial_Guinea" =>"Equatorial Guinea"  ,"Eritrea" =>"Eritrea"  ,"Estonia" =>"Estonia"  ,"Ethiopia" =>"Ethiopia"  ,"Falkland_Islands__Malvinas_" =>"Falkland Islands (Malvinas)"  ,"Faroe_Islands" =>"Faroe Islands"  ,"Fiji" =>"Fiji"  ,"Finland" =>"Finland"  ,"France" =>"France"  ,"French_Guiana" =>"French Guiana"  ,"French_Polynesia" =>"French Polynesia"  ,"French_Southern_Territories" =>"French Southern Territories"  ,"Gabon" =>"Gabon"  ,"Gambia" =>"Gambia"  ,"Georgia" =>"Georgia"  ,"Germany" =>"Germany"  ,"Ghana" =>"Ghana"  ,"Gibraltar" =>"Gibraltar"  ,"Greece" =>"Greece"  ,"Greenland" =>"Greenland"  ,"Grenada" =>"Grenada"  ,"Guadeloupe" =>"Guadeloupe"  ,"Guam" =>"Guam"  ,"Guatemala" =>"Guatemala"  ,"Guernsey" =>"Guernsey"  ,"Guinea" =>"Guinea"  ,"Guinea_Bissau" =>"Guinea-Bissau"  ,"Guyana" =>"Guyana"  ,"Haiti" =>"Haiti"  ,"Heard_Island_And_Mcdonald_Islands" =>"Heard Island And Mcdonald Islands"  ,"Holy_See__Vatican_City_State_" =>"Holy See (Vatican City State)"  ,"Honduras" =>"Honduras"  ,"Hong_Kong" =>"Hong Kong"  ,"Hungary" =>"Hungary"  ,"Iceland" =>"Iceland"  ,"India" =>"India"  ,"Indonesia" =>"Indonesia"  ,"Iran_Islamic_Republic_Of" =>"Iran, Islamic Republic Of"  ,"Iraq" =>"Iraq"  ,"Ireland" =>"Ireland"  ,"Isle_of_Man" =>"Isle of Man"  ,"Israel" =>"Israel"  ,"Italy" =>"Italy"  ,"Jamaica" =>"Jamaica"  ,"Japan" =>"Japan"  ,"Jersey" =>"Jersey"  ,"Jordan" =>"Jordan"  ,"Kazakhstan" =>"Kazakhstan"  ,"Kenya" =>"Kenya"  ,"Kiribati" =>"Kiribati"  ,"Korea_Democratic_PeopleS_Republic_Of" =>"Korea, Democratic People'S Republic Of"  ,"Korea_Republic_Of" =>"Korea, Republic Of"  ,"Kuwait" =>"Kuwait"  ,"Kyrgyzstan" =>"Kyrgyzstan"  ,"Lao_Peoples_Democratic_Republic" =>"Lao People's Democratic Republic"  ,"Latvia" =>"Latvia"  ,"Lebanon" =>"Lebanon"  ,"Lesotho" =>"Lesotho"  ,"Liberia" =>"Liberia"  ,"Libya" =>"Libya"  ,"Liechtenstein" =>"Liechtenstein"  ,"Lithuania" =>"Lithuania"  ,"Luxembourg" =>"Luxembourg"  ,"Macao" =>"Macao"  ,"Macedonia_The_Former_Yugoslav_Republic_Of" =>"Macedonia, The Former Yugoslav Republic Of"  ,"Madagascar" =>"Madagascar"  ,"Malawi" =>"Malawi"  ,"Malaysia" =>"Malaysia"  ,"Maldives" =>"Maldives"  ,"Mali" =>"Mali"  ,"Malta" =>"Malta"  ,"Marshall_Islands" =>"Marshall Islands"  ,"Martinique" =>"Martinique"  ,"Mauritania" =>"Mauritania"  ,"Mauritius" =>"Mauritius"  ,"Mayotte" =>"Mayotte"  ,"Mexico" =>"Mexico"  ,"Micronesia_Federated_States_Of" =>"Micronesia, Federated States Of"  ,"Moldova_Republic_Of" =>"Moldova, Republic Of"  ,"Monaco" =>"Monaco"  ,"Mongolia" =>"Mongolia"  ,"Montenegro" =>"Montenegro"  ,"Montserrat" =>"Montserrat"  ,"Morocco" =>"Morocco"  ,"Mozambique" =>"Mozambique"  ,"Myanmar" =>"Myanmar"  ,"Namibia" =>"Namibia"  ,"Nauru" =>"Nauru"  ,"Nepal" =>"Nepal"  ,"Netherlands" =>"Netherlands"  ,"New_Caledonia" =>"New Caledonia"  ,"New_Zealand" =>"New Zealand"  ,"Nicaragua" =>"Nicaragua"  ,"Niger" =>"Niger"  ,"Nigeria" =>"Nigeria"  ,"Niue" =>"Niue"  ,"Norfolk_Island" =>"Norfolk Island"  ,"Northern_Mariana_Islands" =>"Northern Mariana Islands"  ,"Norway" =>"Norway"  ,"Oman" =>"Oman"  ,"Pakistan" =>"Pakistan"  ,"Palau" =>"Palau"  ,"Palestinian_Territory_Occupied" =>"Palestinian Territory, Occupied"  ,"Panama" =>"Panama"  ,"Papua_New_Guinea" =>"Papua New Guinea"  ,"Paraguay" =>"Paraguay"  ,"Peru" =>"Peru"  ,"Philippines" =>"Philippines"  ,"Pitcairn" =>"Pitcairn"  ,"Poland" =>"Poland"  ,"Portugal" =>"Portugal"  ,"Puerto_Rico" =>"Puerto Rico"  ,"Qatar" =>"Qatar"  ,"R\u00e9union" =>"R\u00e9union"  ,"Romania" =>"Romania"  ,"Russian_Federation" =>"Russian Federation"  ,"Rwanda" =>"Rwanda"  ,"Saint_Barth\u00e9lemy" =>"Saint Barth\u00e9lemy"  ,"Saint_Helena_Ascension_And_Tristan_Da_Cunha" =>"Saint Helena, Ascension And Tristan Da Cunha"  ,"Saint_Kitts_and_Nevis" =>"Saint Kitts and Nevis"  ,"Saint_Lucia" =>"Saint Lucia"  ,"Saint_Martin__French_Part_" =>"Saint Martin (French Part)"  ,"Saint_Pierre_and_Miquelon" =>"Saint Pierre and Miquelon"  ,"Saint_Vincent_and_the_Grenadines" =>"Saint Vincent and the Grenadines"  ,"Samoa" =>"Samoa"  ,"San_Marino" =>"San Marino"  ,"Sao_Tome_and_Principe" =>"Sao Tome and Principe"  ,"Saudi_Arabia" =>"Saudi Arabia"  ,"Senegal" =>"Senegal"  ,"Serbia" =>"Serbia"  ,"Seychelles" =>"Seychelles"  ,"Sierra_Leone" =>"Sierra Leone"  ,"Singapore" =>"Singapore"  ,"Sint_Maarten__Dutch_part_" =>"Sint Maarten (Dutch part)"  ,"Slovakia" =>"Slovakia"  ,"Slovenia" =>"Slovenia"  ,"Solomon_Islands" =>"Solomon Islands"  ,"Somalia" =>"Somalia"  ,"South_Africa" =>"South Africa"  ,"South_Georgia_And_The_South_Sandwich_Islands" =>"South Georgia And The South Sandwich Islands"  ,"South_Sudan" =>"South Sudan"  ,"Spain" =>"Spain"  ,"Sri_Lanka" =>"Sri Lanka"  ,"Sudan" =>"Sudan"  ,"Suriname" =>"Suriname"  ,"Svalbard_And_Jan_Mayen" =>"Svalbard And Jan Mayen"  ,"Swaziland" =>"Swaziland"  ,"Sweden" =>"Sweden"  ,"Switzerland" =>"Switzerland"  ,"Syrian_Arab_Republic" =>"Syrian Arab Republic"  ,"Taiwan_Province_Of_China" =>"Taiwan, Province Of China"  ,"Tajikistan" =>"Tajikistan"  ,"Tanzania_United_Republic_Of" =>"Tanzania, United Republic Of"  ,"Thailand" =>"Thailand"  ,"Timor_Leste" =>"Timor-Leste"  ,"Togo" =>"Togo"  ,"Tokelau" =>"Tokelau"  ,"Tonga" =>"Tonga"  ,"Trinidad_and_Tobago" =>"Trinidad and Tobago"  ,"Tunisia" =>"Tunisia"  ,"Turkey" =>"Turkey"  ,"Turkmenistan" =>"Turkmenistan"  ,"Turks_and_Caicos_Islands" =>"Turks and Caicos Islands"  ,"Tuvalu" =>"Tuvalu"  ,"Uganda" =>"Uganda"  ,"Ukraine" =>"Ukraine"  ,"United_Arab_Emirates" =>"United Arab Emirates"  ,"United_Kingdom" =>"United Kingdom"  ,"United_States" =>"United States"  ,"United_States_Minor_Outlying_Islands" =>"United States Minor Outlying Islands"  ,"Uruguay" =>"Uruguay"  ,"Uzbekistan" =>"Uzbekistan"  ,"Vanuatu" =>"Vanuatu"  ,"Venezuela_Bolivarian_Republic_Of" =>"Venezuela, Bolivarian Republic Of"  ,"Viet_Nam" =>"Viet Nam"  ,"Virgin_Islands_British" =>"Virgin Islands, British"  ,"Virgin_Islands_US" =>"Virgin Islands, U.S."  ,"Wallis_And_Futuna" =>"Wallis And Futuna"  ,"Western_Sahara" =>"Western Sahara"  ,"Yemen" =>"Yemen"  ,"Zambia" =>"Zambia"  ,"Zimbabwe" =>"Zimbabwe"  );
+
+
+  /*
+   * Initialize Arrays that will be populated to build the table
+   */
+  $states = array();
+  $countries = array();
+  $provinces = array();
+  $institution_types = array();
+  $tableRows = array();
+  $table = '';
+
+
+  #Get the stored array to loop through and turn into a table
+  //$result= variable_get('sugar_subscribers');
+  $table_data = file_get_contents(drupal_realpath('public://') . '/sugar_subscribers.txt');
+  $result = unserialize($table_data);
+
+  for($i = 1; $i < count($result); $i++){
+
+    #Will become the Country select list
+    #Get Institution Finder Country Field. If empty, fall back to standard country field
+    $cntry = isset($country_keys[$result[$i]['if_country_c']]) ? $country_keys[$result[$i]['if_country_c']] : $result[$i]['if_country_c'];
+    if(empty($ctnry)){
+      $cntry = isset($country_keys[$result[$i]['country_list_c']]) ? $country_keys[$result[$i]['country_list_c']] : $cntry;
+
+    }
+
+    if( !empty($cntry) &&  !in_array($cntry, $countries)){
+      array_push($countries, $cntry);
+    }
+
+    #Will become the State  or province select list
+    if( !empty($result[$i]['state_list_c']) ){
+      if($result[$i]['if_country_c'] == "United_States"){
+        array_push($states, $result[$i]['state_list_c']);
+      }
+      if($result[$i]['if_country_c'] == "Canada"){
+        array_push($provinces, $result[$i]['state_list_c']);
+      }
+    }
+
+
+
+    #Will become the institution type select list  if_community_c
+    if(!in_array($result[$i]['if_community_c'], $institution_types)){
+      $in = $result[$i]['if_community_c'];
+      if(!empty($in)){
+        array_push($institution_types, $in);
+      }
+
+    }
+
+    # Get name, first check Institution Finder Name, fall back to English Promotional Name, then fall back to Sugar Account Name
+    if(isset($result[$i]['if_promotional_name_english_c']) && !empty($result[$i]['if_promotional_name_english_c']) ){
+      $name = $result[$i]['if_promotional_name_english_c'];
+    }elseif(isset($result[$i]['institution_c']) && !empty($result[$i]['institution_c']) ){
+      $name = $result[$i]['institution_c'];
+    }else{
+      $name = $result[$i]['name'];
+    }
+
+    #Each row of the array will become a table row. The array is keyed by institution name for easy alphabetical sorting
+    $tableRows[$name] = sprintf('<tr><td class="institution">%s</td> <td class="country">%s</td> <td class="state">%s</td><td class="type" style="display:none;">%s</td></tr>',
+        $name, $cntry, str_replace('_',' ',$result[$i]['state_list_c']), $result[$i]['if_community_c']);
+
+  }
+  $states = array_unique($states);
+  $provinces = array_unique($provinces);
+  natksort($tableRows);
+  asort($countries);
+  asort($states);
+  asort($provinces);
+  asort($institution_types);
+
+  /*
+   * Create title list to be used by autocomplete
+   */
+
+  $availableTags = "[";
+  foreach($tableRows as $k => $v){
+    $table .= $v;
+    $availableTags .= '"' . str_replace(array("'", ":", '"',"."), "", $k) . '",';
+  }
+  $availableTags .= "]";
+
+
+  /*
+   * Create HTML for Country Select Menu
+   */
+
+  $country_select = '<div id="edit-field-country-value-wrapper">';
+  $country_select .= '<select class="styled form-select" id="countries" name="field_country_value"><option value selected="selected">Choose Country</option>';
+  foreach($countries as $c){
+    if(!empty($c)){
+      $country_select .= sprintf('<option value="%s">%s</option>', $c, $c);
+    }
+  }
+  $country_select .= '</select></div>';
+  /*
+   * Create HTML for State and Province Select Menus
+   */
+
+  $state_select = '<div id="state-wrapper">';
+  $state_select .= '<select disabled="disabled" class="styled form-select" id="states" name="field_state_territory_value"><option value="" selected="selected">Choose State</option>';
+  foreach($states as $s){
+    if(!empty($s)){
+      $state_select .= sprintf('<option value="%s" class="USA">%s</option>', $s, $s);
+    }
+  }
+  $state_select .= '</select></div>';
+  $state_select .= '<div id="province-wrapper" style="display:none;">';
+  $state_select .= '<select class="styled form-select" id="provinces" name="field_province_territory_value" ><option value="" selected="selected">Choose Province/Territory</option>';
+
+  //TODO: Change to array_map() or walk
+  foreach($provinces as $p){
+    if(!empty($p)){
+      $state_select .= sprintf('<option value="%s" class="CAN">%s</option>', $p, $p);
+    }
+  }
+  $state_select .= '</select></div>';
+
+  /*
+   * Create HTML for Institution Type Select Menu
+   */
+  $inst_type_select = '<div id="inst-type-wrapper">';
+  $inst_type_select .= '<select disabled="disabled" class="styled form-select" id="inst-type" name="inst_type_value" ><option value="" selected="selected">Choose Institution Type</option>';
+  //TODO: Change to array_map() or walk
+  foreach($institution_types as $it){
+    if(!empty($it)){
+      $inst_type_select .= sprintf('<option value="%s" class="USA">%s</option>', $it, $it);
+    }
+
+  }
+  $inst_type_select .= '</select></div>';
+
+
+  #Title Search input
+  $title_select = '<div class="ui-widget" id="title-select">
+                  <input id="tags" placeholder="Enter Institution Name">
+                  </div>';
+
+  #HTML for Apply and Reset Buttons
+  $buttons = '<div class="views-exposed-widget views-submit-button" id="title-submit">
+              <input type="submit" id="edit-submit-current-subscribers" name="" value="Apply" class="form-submit" />    </div>
+               <div class="views-exposed-widget views-reset-button" id="title-reset">
+              <input type="submit" id="edit-reset" name="op" value="Reset" class="form-submit reset" /></div>';
+
+
+  /*
+   * Begin building the actual table, written to the $str variable
+   */
+  #TODO: Consider Sprintf -might be cleaner than this concatenation marathon
+  $str = '<div id="loding"><span>Loading...</span></div>';
+  $str .= '<div class="curntsubContnt" style="display:none">';
+  $str .= '<div id="sub-message"><h4>See who’s getting access to JSTOR. Search institutions by name, or filter the list by country.</h4></div>';
+  /*
+   * Search filters above table
+   */
+  $str .= '<div id="topsearch">';
+  $str .= '<div id="dropdowns">';
+  $str .= $title_select;
+  $str .= '<span class="or">or</span>';
+  $str .= $country_select;
+  $str .= $state_select;
+  $str .= $inst_type_select;
+  #$str .= '</div>';
+  #$str .= '<div id="titlefields">';
+
+  $str .= $buttons;
+  $str .= '</div>';
+  $str .= '</div>';
+
+  /*
+   * Header with subscriber count
+   */
+  $str .= sprintf('<div class="heading"><h3>%s subscribers</h3></div>', count($result) -1 );
+
+
+  /*
+   * Building the actual HTML table
+   */
+  $str .= '<div id="tableCont"><table class="tablesorter" id="subscriberTable">';
+  $str .= '<thead style="display:none;"><tr><th class="institution-header" data-placeholder="Filter by name">INSTITUTION</th>
+               <th class="country-header" data-placeholder="Filter by Country">COUNTRY</th>
+               <th class="state-header" data-placeholder="Filter by State">STATE</th>
+               <th style="display:none;" class="filter-select" data-placeholder="Filter by type">Type</th></tr></thead>';
+  $str .= '<tbody>';
+  $str .= $table;
+  $str .=  '</tbody>';
+  $str .= "</table></div>";
+  $str .= '<div id="noResults" style="display:none;"><h4>This search returned no results, please check your search term or reset the search and try again</h4></div>';
+  $str .= "</div>";
+  #If the table is below a certain size, it's quite likely a building error occurred
+  #This is a final check to make sure it's truly OK to write that new table.
+  if(strlen($str) < 500){
+    watchdog('subscriber table', "Size of primary data returned was significantly smaller than expected - table was not updated" );
+    return "<h2>Size of data returned was significantly smaller than expected - table was not updated</h2>";
+  }else{
+    $num = count($result) -1;
+    //variable_set('subscriber_table', $str);
+    file_put_contents(drupal_realpath('public://') . '/subscriber_table.txt', $str);
+    //variable_set('subscriber_autocomplete', $availableTags);
+    file_put_contents(drupal_realpath('public://') . '/subscriber_autocomplete.txt', $availableTags);
+    watchdog('subscriber table', "Successfully generated new primary table with " . $num  ." records" );
+    return "<h2>Successfully generated new subscriber table with " . $num  ." records</h2>";
+  }
+}
+
+
+/*
+ * build a special table for ie versions that can't handle the real deal
+ */
+
+function _data_for_ie(){
+  $country_keys = array (  "Afghanistan" =>"Afghanistan"  ,"Aland_Islands" =>"Aland Islands"  ,"Albania" =>"Albania"  ,"Algeria" =>"Algeria"  ,"American_Samoa" =>"American Samoa"  ,"Andorra" =>"Andorra"  ,"Angola" =>"Angola"  ,"Anguilla" =>"Anguilla"  ,"Antarctica" =>"Antarctica"  ,"Antigua_and_Barbuda" =>"Antigua and Barbuda"  ,"Argentina" =>"Argentina"  ,"Armenia" =>"Armenia"  ,"Aruba" =>"Aruba"  ,"Australia" =>"Australia"  ,"Austria" =>"Austria"  ,"Azerbaijan" =>"Azerbaijan"  ,"Bahamas" =>"Bahamas"  ,"Bahrain" =>"Bahrain"  ,"Bangladesh" =>"Bangladesh"  ,"Barbados" =>"Barbados"  ,"Belarus" =>"Belarus"  ,"Belgium" =>"Belgium"  ,"Belize" =>"Belize"  ,"Benin" =>"Benin"  ,"Bermuda" =>"Bermuda"  ,"Bhutan" =>"Bhutan"  ,"Bolivia_Plurinational_State_Of" =>"Bolivia, Plurinational State Of"  ,"Bonaire_Sint_Eustatius_And_Saba" =>"Bonaire, Sint Eustatius And Saba"  ,"Bosnia_and_Herzegovina" =>"Bosnia and Herzegovina"  ,"Botswana" =>"Botswana"  ,"Bouvet_Island" =>"Bouvet Island"  ,"Brazil" =>"Brazil"  ,"British_Indian_Ocean_Territory" =>"British Indian Ocean Territory"  ,"Brunei_Darussalam" =>"Brunei Darussalam"  ,"Bulgaria" =>"Bulgaria"  ,"Burkina_Faso" =>"Burkina Faso"  ,"Burundi" =>"Burundi"  ,"Cambodia" =>"Cambodia"  ,"Cameroon" =>"Cameroon"  ,"Canada" =>"Canada"  ,"Cape_Verde" =>"Cape Verde"  ,"Cayman_Islands" =>"Cayman Islands"  ,"Central_African_Republic" =>"Central African Republic"  ,"Chad" =>"Chad"  ,"Chile" =>"Chile"  ,"China" =>"China"  ,"Christmas_Island" =>"Christmas Island"  ,"Cocos__Keeling__Islands" =>"Cocos (Keeling) Islands"  ,"Colombia" =>"Colombia"  ,"Comoros" =>"Comoros"  ,"Congo" =>"Congo"  ,"Congo_The_Democratic_Republic_of_the" =>"Congo, The Democratic Republic of the"  ,"Cook_Islands" =>"Cook Islands"  ,"Costa_Rica" =>"Costa Rica"  ,"Cote_dIvoire" =>"Cote d'Ivoire"  ,"Croatia" =>"Croatia"  ,"Cuba" =>"Cuba"  ,"Cura\u00e7ao" =>"Cura\u00e7ao"  ,"Cyprus" =>"Cyprus"  ,"Czech_Republic" =>"Czech Republic"  ,"Denmark" =>"Denmark"  ,"Djibouti" =>"Djibouti"  ,"Dominica" =>"Dominica"  ,"Dominican_Republic" =>"Dominican Republic"  ,"Ecuador" =>"Ecuador"  ,"Egypt" =>"Egypt"  ,"El_Salvador" =>"El Salvador"  ,"Equatorial_Guinea" =>"Equatorial Guinea"  ,"Eritrea" =>"Eritrea"  ,"Estonia" =>"Estonia"  ,"Ethiopia" =>"Ethiopia"  ,"Falkland_Islands__Malvinas_" =>"Falkland Islands (Malvinas)"  ,"Faroe_Islands" =>"Faroe Islands"  ,"Fiji" =>"Fiji"  ,"Finland" =>"Finland"  ,"France" =>"France"  ,"French_Guiana" =>"French Guiana"  ,"French_Polynesia" =>"French Polynesia"  ,"French_Southern_Territories" =>"French Southern Territories"  ,"Gabon" =>"Gabon"  ,"Gambia" =>"Gambia"  ,"Georgia" =>"Georgia"  ,"Germany" =>"Germany"  ,"Ghana" =>"Ghana"  ,"Gibraltar" =>"Gibraltar"  ,"Greece" =>"Greece"  ,"Greenland" =>"Greenland"  ,"Grenada" =>"Grenada"  ,"Guadeloupe" =>"Guadeloupe"  ,"Guam" =>"Guam"  ,"Guatemala" =>"Guatemala"  ,"Guernsey" =>"Guernsey"  ,"Guinea" =>"Guinea"  ,"Guinea_Bissau" =>"Guinea-Bissau"  ,"Guyana" =>"Guyana"  ,"Haiti" =>"Haiti"  ,"Heard_Island_And_Mcdonald_Islands" =>"Heard Island And Mcdonald Islands"  ,"Holy_See__Vatican_City_State_" =>"Holy See (Vatican City State)"  ,"Honduras" =>"Honduras"  ,"Hong_Kong" =>"Hong Kong"  ,"Hungary" =>"Hungary"  ,"Iceland" =>"Iceland"  ,"India" =>"India"  ,"Indonesia" =>"Indonesia"  ,"Iran_Islamic_Republic_Of" =>"Iran, Islamic Republic Of"  ,"Iraq" =>"Iraq"  ,"Ireland" =>"Ireland"  ,"Isle_of_Man" =>"Isle of Man"  ,"Israel" =>"Israel"  ,"Italy" =>"Italy"  ,"Jamaica" =>"Jamaica"  ,"Japan" =>"Japan"  ,"Jersey" =>"Jersey"  ,"Jordan" =>"Jordan"  ,"Kazakhstan" =>"Kazakhstan"  ,"Kenya" =>"Kenya"  ,"Kiribati" =>"Kiribati"  ,"Korea_Democratic_PeopleS_Republic_Of" =>"Korea, Democratic People'S Republic Of"  ,"Korea_Republic_Of" =>"Korea, Republic Of"  ,"Kuwait" =>"Kuwait"  ,"Kyrgyzstan" =>"Kyrgyzstan"  ,"Lao_Peoples_Democratic_Republic" =>"Lao People's Democratic Republic"  ,"Latvia" =>"Latvia"  ,"Lebanon" =>"Lebanon"  ,"Lesotho" =>"Lesotho"  ,"Liberia" =>"Liberia"  ,"Libya" =>"Libya"  ,"Liechtenstein" =>"Liechtenstein"  ,"Lithuania" =>"Lithuania"  ,"Luxembourg" =>"Luxembourg"  ,"Macao" =>"Macao"  ,"Macedonia_The_Former_Yugoslav_Republic_Of" =>"Macedonia, The Former Yugoslav Republic Of"  ,"Madagascar" =>"Madagascar"  ,"Malawi" =>"Malawi"  ,"Malaysia" =>"Malaysia"  ,"Maldives" =>"Maldives"  ,"Mali" =>"Mali"  ,"Malta" =>"Malta"  ,"Marshall_Islands" =>"Marshall Islands"  ,"Martinique" =>"Martinique"  ,"Mauritania" =>"Mauritania"  ,"Mauritius" =>"Mauritius"  ,"Mayotte" =>"Mayotte"  ,"Mexico" =>"Mexico"  ,"Micronesia_Federated_States_Of" =>"Micronesia, Federated States Of"  ,"Moldova_Republic_Of" =>"Moldova, Republic Of"  ,"Monaco" =>"Monaco"  ,"Mongolia" =>"Mongolia"  ,"Montenegro" =>"Montenegro"  ,"Montserrat" =>"Montserrat"  ,"Morocco" =>"Morocco"  ,"Mozambique" =>"Mozambique"  ,"Myanmar" =>"Myanmar"  ,"Namibia" =>"Namibia"  ,"Nauru" =>"Nauru"  ,"Nepal" =>"Nepal"  ,"Netherlands" =>"Netherlands"  ,"New_Caledonia" =>"New Caledonia"  ,"New_Zealand" =>"New Zealand"  ,"Nicaragua" =>"Nicaragua"  ,"Niger" =>"Niger"  ,"Nigeria" =>"Nigeria"  ,"Niue" =>"Niue"  ,"Norfolk_Island" =>"Norfolk Island"  ,"Northern_Mariana_Islands" =>"Northern Mariana Islands"  ,"Norway" =>"Norway"  ,"Oman" =>"Oman"  ,"Pakistan" =>"Pakistan"  ,"Palau" =>"Palau"  ,"Palestinian_Territory_Occupied" =>"Palestinian Territory, Occupied"  ,"Panama" =>"Panama"  ,"Papua_New_Guinea" =>"Papua New Guinea"  ,"Paraguay" =>"Paraguay"  ,"Peru" =>"Peru"  ,"Philippines" =>"Philippines"  ,"Pitcairn" =>"Pitcairn"  ,"Poland" =>"Poland"  ,"Portugal" =>"Portugal"  ,"Puerto_Rico" =>"Puerto Rico"  ,"Qatar" =>"Qatar"  ,"R\u00e9union" =>"R\u00e9union"  ,"Romania" =>"Romania"  ,"Russian_Federation" =>"Russian Federation"  ,"Rwanda" =>"Rwanda"  ,"Saint_Barth\u00e9lemy" =>"Saint Barth\u00e9lemy"  ,"Saint_Helena_Ascension_And_Tristan_Da_Cunha" =>"Saint Helena, Ascension And Tristan Da Cunha"  ,"Saint_Kitts_and_Nevis" =>"Saint Kitts and Nevis"  ,"Saint_Lucia" =>"Saint Lucia"  ,"Saint_Martin__French_Part_" =>"Saint Martin (French Part)"  ,"Saint_Pierre_and_Miquelon" =>"Saint Pierre and Miquelon"  ,"Saint_Vincent_and_the_Grenadines" =>"Saint Vincent and the Grenadines"  ,"Samoa" =>"Samoa"  ,"San_Marino" =>"San Marino"  ,"Sao_Tome_and_Principe" =>"Sao Tome and Principe"  ,"Saudi_Arabia" =>"Saudi Arabia"  ,"Senegal" =>"Senegal"  ,"Serbia" =>"Serbia"  ,"Seychelles" =>"Seychelles"  ,"Sierra_Leone" =>"Sierra Leone"  ,"Singapore" =>"Singapore"  ,"Sint_Maarten__Dutch_part_" =>"Sint Maarten (Dutch part)"  ,"Slovakia" =>"Slovakia"  ,"Slovenia" =>"Slovenia"  ,"Solomon_Islands" =>"Solomon Islands"  ,"Somalia" =>"Somalia"  ,"South_Africa" =>"South Africa"  ,"South_Georgia_And_The_South_Sandwich_Islands" =>"South Georgia And The South Sandwich Islands"  ,"South_Sudan" =>"South Sudan"  ,"Spain" =>"Spain"  ,"Sri_Lanka" =>"Sri Lanka"  ,"Sudan" =>"Sudan"  ,"Suriname" =>"Suriname"  ,"Svalbard_And_Jan_Mayen" =>"Svalbard And Jan Mayen"  ,"Swaziland" =>"Swaziland"  ,"Sweden" =>"Sweden"  ,"Switzerland" =>"Switzerland"  ,"Syrian_Arab_Republic" =>"Syrian Arab Republic"  ,"Taiwan_Province_Of_China" =>"Taiwan, Province Of China"  ,"Tajikistan" =>"Tajikistan"  ,"Tanzania_United_Republic_Of" =>"Tanzania, United Republic Of"  ,"Thailand" =>"Thailand"  ,"Timor_Leste" =>"Timor-Leste"  ,"Togo" =>"Togo"  ,"Tokelau" =>"Tokelau"  ,"Tonga" =>"Tonga"  ,"Trinidad_and_Tobago" =>"Trinidad and Tobago"  ,"Tunisia" =>"Tunisia"  ,"Turkey" =>"Turkey"  ,"Turkmenistan" =>"Turkmenistan"  ,"Turks_and_Caicos_Islands" =>"Turks and Caicos Islands"  ,"Tuvalu" =>"Tuvalu"  ,"Uganda" =>"Uganda"  ,"Ukraine" =>"Ukraine"  ,"United_Arab_Emirates" =>"United Arab Emirates"  ,"United_Kingdom" =>"United Kingdom"  ,"United_States" =>"United States"  ,"United_States_Minor_Outlying_Islands" =>"United States Minor Outlying Islands"  ,"Uruguay" =>"Uruguay"  ,"Uzbekistan" =>"Uzbekistan"  ,"Vanuatu" =>"Vanuatu"  ,"Venezuela_Bolivarian_Republic_Of" =>"Venezuela, Bolivarian Republic Of"  ,"Viet_Nam" =>"Viet Nam"  ,"Virgin_Islands_British" =>"Virgin Islands, British"  ,"Virgin_Islands_US" =>"Virgin Islands, U.S."  ,"Wallis_And_Futuna" =>"Wallis And Futuna"  ,"Western_Sahara" =>"Western Sahara"  ,"Yemen" =>"Yemen"  ,"Zambia" =>"Zambia"  ,"Zimbabwe" =>"Zimbabwe"  );
+
+
+  $states = array();
+  $countries = array();
+  $provinces = array();
+  $institution_types = array();
+  $byCountry = array();
+
+  #Create a SimpleXML object from the downloaded XML string
+
+  //$result = variable_get('sugar_subscribers');
+  $table_data = file_get_contents(drupal_realpath('public://') . '/sugar_subscribers.txt');
+  $result = unserialize($table_data);
+
+  #loop through XML to populate arrays that will eventually become part of the
+  #subscriber table
+  for($i = 1; $i < count($result); $i++){
+    #Will become the Country select list
+
+    #return isset($country_keys) ? $record['if_country_c'];=
+    $cntry = isset($country_keys[$result[$i]['if_country_c']]) ? $country_keys[$result[$i]['if_country_c']] : $result[$i]['if_country_c'];
+    if(empty($ctnry)){
+      $cntry = isset($country_keys[$result[$i]['country_list_c']]) ? $country_keys[$result[$i]['country_list_c']] : $cntry;
+
+    }
+    if( !empty($cntry) &&  !in_array($cntry, $countries)){
+      array_push($countries, $cntry);
+    }
+    #Will become the State select list
+    if( !empty($result[$i]['state_list_c'])  && !in_array($result[$i]['state_list_c'], $states)){
+      if($result[$i]['if_country_c'] == "United_States"){
+        array_push($states, $result[$i]['if_country_c']);
+      }
+    }
+    #Will become the Province select list
+    if( !empty($result[$i]['state_list_c'])  && !in_array($result[$i]['state_list_c'], $provinces)){
+      if($result[$i]['if_country_c'] == "Canada"){
+        array_push($provinces, $result[$i]['state_list_c']);
+      }
+    }
+    #Will become the institution type select list  if_community_c
+    if(!in_array($result[$i]['if_community_c'], $institution_types)){
+      $in = $result[$i]['if_community_c'];
+      if(!empty($in)){
+        array_push($institution_types, $in);
+      }
+
+    }
+
+    if(isset($result[$i]['if_promotional_name_english_c']) && !empty($result[$i]['if_promotional_name_english_c']) ){
+      $name = $result[$i]['if_promotional_name_english_c'];
+    }elseif(isset($result[$i]['institution_c']) && !empty($result[$i]['institution_c']) ){
+      $name = $result[$i]['institution_c'];
+    }else{
+      $name = $result[$i]['name'];
+    }
+
+    if(!empty($cntry)){
+      if($cntry != "Canada" && $cntry != "United States"){
+        $byCountry[$cntry][] = $name;
+      }
+      if($cntry == "Canada"){
+        $province = $result[$i]['state_list_c'];
+        if(!empty($province)){
+          $byCountry["Canada"][$result[$i]['state_list_c']][] = $name;
+        }else{
+          $byCountry["Canada"]["Not Specified"][] = $name;
+        }
+
+      }
+      if($cntry == "United States"){
+        $state = $result[$i]['state_list_c'];
+        if(!empty($state)){
+          $byCountry["United States"][$result[$i]['state_list_c']][] = $name;
+        }else{
+          $byCountry["United States"]["Not Specified"][] = $name;
+        }
+
+      }
+
+    }
+
+  }
+
+  ksort($byCountry);
+  ksort($byCountry["Canada"]);
+  ksort($byCountry["United States"]);
+  foreach($byCountry["Canada"] as $k => $v){
+    asort($byCountry["Canada"][$k]);
+  }
+  foreach($byCountry["United States"] as $k => $v){
+    asort($byCountry["United States"][$k]);
+  }
+
+  $string = '<div class="page-jstor-help-support"><div class="pageContainer" style="margin-left:0px;">';
+  foreach($byCountry as $country => $data){
+    $string .= sprintf('<div class="countrywrapper"><h3><a href="#">%s</a></h3>', $country);
+    if($country != "Canada" && $country != "United States"){
+      $string .= '<ul style="list-style:none;display:none;">';
+      foreach($data as $d){
+        $string .= sprintf('<li style="padding-left:20px;">%s</li>', $d);
+      }
+      $string .= "</ul>";
+    }else{
+      foreach($data as $location => $institutions){
+        $string .= sprintf('<h4 style="display:none;padding-left:30px;color:#000000;font-weight:bold;">%s</h4>', $location);
+        $string .= '<ul style="margin-left:10px;list-style:none;display:none;">';
+        foreach($institutions as $institution){
+          $string .= sprintf('<li style="padding-left:40px;">%s</li>', $institution);
+        }
+        $string .= "</ul>";
+
+      }
+
+    }
+    $string .= '</div>';
+  }
+  $string .= '</div></div>';
+
+  $message = '<div><h4 style="color: rgb(116, 116, 116);">See who’s getting access to JSTOR.</h4>
+    <h6>This is an Internet Explorer 10 compatible version of the JSTOR institutions page. If you would like to use the full-featured institutions page, you can do so by using a different browser or upgrading to Internet Explorer 11 or higher. The full featured page provides search by name and filtering by country, state/province and institution type.</h6>
+    </div><br/>';
+  #$message .= sprintf('<div class="heading"><h3>%s subscribers<span>(Updated %s )</span></h3></div>', count($result) -1 , date("F j, Y", time()));
+  $message .= sprintf('<div class="heading" style="border-bottom: 2px solid #ccc;border-top: 2px solid #ccc;padding: 5px 15px;"><h3>%s subscribers</h3></div><br/>', count($result) -1 );
+  if(strlen($string) < 50000){
+    watchdog('subscriber table', "Size of ie data returned was significantly smaller than expected - table was not updated" );
+    return "<h2>Size of data returned was significantly smaller than expected - table was not updated</h2>";
+  }else{
+    $num = count($result) -1;
+    //variable_set('ie_subscriber_table', $message . $string);
+    file_put_contents(drupal_realpath('public://') . '/ie_subscriber_table.txt', $message . $string);
+    watchdog('subscriber table', "Successfully generated new ie table with " . $num  ." records" );
+    return "<h2>Successfully generated new subscriber table with " . $num  ." records</h2>";
+  }
+
+}
+
+/*
+ * callback that renders the JSTOR subscribers page
+ */
+
+function _list_institutions(){
+
+  if ( strpos($_SERVER['HTTP_USER_AGENT'], 'MSIE 10') ){
+    drupal_goto("ie-subscriber-list");
+  }
+
+  drupal_add_js(drupal_get_path('theme', 'jstor') . '/js/subscribers.js');
+  drupal_add_js('http://code.jquery.com/ui/1.10.4/jquery-ui.js', 'external');
+  drupal_add_css(drupal_get_path('theme', 'jstor') ."/css/jquery-ui.css", 'file');
+  //$table = variable_get('subscriber_table', 'What table?');
+  $table = file_get_contents(drupal_realpath('public://') . '/subscriber_table.txt');
+  //$autocomplete = variable_get('subscriber_autocomplete', 'no tags');
+  $autocomplete = file_get_contents(drupal_realpath('public://') . '/subscriber_autocomplete.txt');
+
+
+  # autocomplete js that is built dynamically based on the current names
+  //TODO: Consider HEREDOC or including the javascript, this string is unwieldy! While you're at it, put $ in as function argument, no reason to keep typing jQuery :)
+  $js_string = "jQuery(document).ready( function () {var NoResultsLabel = \"This search returned no results, please check your search term or enter a new search term and try again\";var availableTags=" .$autocomplete . ";
+    jQuery('#tags').autocomplete({
+        source: function(request, response) {
+            var results = jQuery.ui.autocomplete.filter(availableTags, request.term);
+
+            if (!results.length) {
+                results = [NoResultsLabel];
+            }
+
+            response(results);
+        },
+        select: function (event, ui) {
+            if (ui.item.label === NoResultsLabel) {
+                event.preventDefault();
+            }
+        },
+        focus: function (event, ui) {
+            if (ui.item.label === NoResultsLabel) {
+                event.preventDefault();
+            }
+        }
+    });
+
+    jQuery('#tags').attr('autocomplete', 'on');});";
+  drupal_add_js($js_string, 'inline');
+  if(strlen($table) > 500){
+    return $table;
+  }else{
+    return '<h5>The Institutions list is rebuilding and will be back shortly</h5>';
+  }
+}
+
+/*
+ * callback that renders the ie subscriber page
+ */
+
+function _list_ie_data(){
+  # js to be added to page
+  //TODO: Consider HEREDOC or including the javascript, this string is unwieldy! While you're at it, put $ in as function argument, no reason to keep typing jQuery :)
+  $js_string = "jQuery(document).ready( function () {
+    jQuery('h3 a').click(function(e){
+		e.preventDefault();
+		jQuery('.countrywrapper ul').hide();
+		jQuery('.countrywrapper h4').hide();
+
+		if( jQuery(this).hasClass('active') ){
+		  jQuery('.countrywrapper h3 a').removeClass('active');
+		}else{
+          jQuery('.countrywrapper h3 a').removeClass('active');
+          jQuery(this).addClass('active');
+          var closest = jQuery(this).closest('.countrywrapper');
+          closest.find('ul').show();
+          closest.find('h4').show();
+		}
+	  });
+
+  });";
+  drupal_add_js($js_string, 'inline');
+
+  $table = file_get_contents(drupal_realpath('public://') . '/ie_subscriber_table.txt');
+  if(strlen($table) > 500){
+    return $table;
+  }else{
+    return '<div class="heading" style="border-bottom: 2px solid #ccc;border-top: 2px solid #ccc;padding: 5px 15px;">The Institutions list is rebuilding and will be back shortly</div>';
+  }
+}

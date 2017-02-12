@@ -1,0 +1,11 @@
+name = Data to Node
+description = Feeds had a tendency to fail - and was indeceipherable to non technical users. Here's a simpler way to Bring in external cs, tab or xml data and map to nodes
+core = 7.x
+package = JSTOR Importers
+version = "7.x-1.0"
+core = "7.x"
+project = "ITHAKA"
+configure = content-importer
+
+files[] = data_to_node.install
+files[] = data_to_node.module

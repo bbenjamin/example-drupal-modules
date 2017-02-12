@@ -1,0 +1,261 @@
+<?php
+function jstor_faqs_menu() {
+    $items['jstor-help-support'] = array(
+      'page callback' => '_jstor_faq_landing_page',
+      'access callback' => true,
+      'title'=> 'Help & Support'
+    ); 
+    $items['frequently-asked-questions'] = array(
+      'page callback' => '_jstor_faq_general_landing_page',
+      'access callback' => true,
+      'title'=> 'Frequently Asked Questions'
+    ); 
+    $items['frequently-asked-questions/%'] = array(
+      'page callback' => '_jstor_faq_page',
+      'access callback' => true,
+      'page arguments' => array(1,null),
+      'title'=> 'FAQs'
+    );    
+    $items['jstor-help-support/%'] = array(
+      'page callback' => '_jstor_faq_page',
+      'access callback' => true,
+      'page arguments' => array(1,null),
+      'title'=> 'FAQs'
+    );  
+    $items['jstor-help-support/%/%/%'] = array(
+      'page callback' => '_jstor_faq_page',
+      'access callback' => true,
+      'page arguments' => array(1,2,3),
+      'title'=> 'FAQs'
+    );
+    return $items;
+}
+/*
+ * Triage the request and display a faq page based on URL - some args are deprecated but kept here to not disrupt unnecessarily
+ */
+function _jstor_faq_page($primary = null, $secondary = null, $selection = null){
+  if(!is_null($primary) ){
+      #why text tile caching? it was the best load time by far
+      if( file_exists(drupal_realpath('public://') . '/helpsupport-' . $primary . '.txt')){
+          $html = file_get_contents(drupal_realpath('public://') . '/helpsupport-' . $primary . '.txt');
+          if(!empty($html)){
+              return $html;
+          }
+      }
+     $primary_node = node_load($primary);
+     $primary_title = $primary_node->title;
+     drupal_set_title($primary_title);
+
+     $veew = views_get_view('faqs');
+     $veew->set_display('secondary');
+     $veew->set_arguments(array($primary));
+     $html = '';
+     if(isset($primary_node->body['und'][0]['value']) && !empty($primary_node->body['und'][0]['value'])){
+        $html .= '<div class="faqbody">' . $primary_node->body['und'][0]['value'] . '</div>';
+     }
+     $html .= $veew->render();
+     $html .= '<div id="jstor_faqs-ajax-wrapper">';
+     $secondary_ids = "";
+     foreach($veew->result as $v){
+         $secondary_ids .= $v->nid . "+";
+     }
+
+     $secondary_ids = substr($secondary_ids,0,-1);
+     $view = views_get_view('faqs');
+     $view->set_display('questions');
+     $view->set_arguments(array($secondary_ids));
+     $html .= $view->render();
+     $html .= '</div>';
+     $html .= '<div class="faqAcordionContr"></div>';
+
+     $cached_help_pages = variable_get('cached_help_pages',array());
+     file_put_contents(drupal_realpath('public://') . '/helpsupport-' . $primary . '.txt', $html);
+     array_push($cached_help_pages, $primary);
+     variable_set('cached_help_pages', array_unique($cached_help_pages));
+     return $html;
+    
+  }else{
+    return _jstor_faq_landing_page();
+  }
+
+  $list = "<ul>";
+  $faq_primary = views_get_view_result('faqs','primary');
+  $faq_secondary = views_get_view_result('faqs','secondary');
+  $faq_questions = views_get_view_result('faqs','questions');
+  
+  foreach($faq_primary as $k => $v){
+    if($v->node_title != 'Website Support'){continue;}
+    foreach($faq_secondary as $kk => $vv){
+      if($v->nid == $vv->field_field_faq_primary_category[0]['raw']['nid']){
+        $list .= '<ul style="margin-left:20px"></h3>' . $vv->node_title .'</h3>';
+        foreach($faq_questions as $kkk => $vvv){
+          if($vv->nid == $vvv->field_field_secondary_category[0]['raw']['nid']){
+            $list .= '<li style="margin-left:50px">';
+            $list .= '<strong>' . $vvv->node_title . '</strong>';
+            $list .= '<div>' . $vvv->field_body[0]['rendered']['#markup'] . '</div>';
+            $list .= '</li>';
+          }
+        } 
+        $list .= '</ul>';
+      }
+    }
+  }
+  
+  $list .= "</ul>";
+  $list .= '<div class="faqAcordionContr"></div>';
+  return $list;
+}
+/*
+ * Presave hook to rebuild text file cache any time relevant content is altered.
+ */
+function jstor_faqs_node_presave($node){
+    if($node->type == 'faq_primary_category' || $node->type == 'faq_secondary_category' || $node->type == 'accordion_compatible_faq' ){
+        $cached_help_pages = variable_get('cached_help_pages',array());
+        foreach($cached_help_pages as $n){
+            file_put_contents(drupal_realpath('public://') . '/helpsupport-' . $n . '.txt', '');
+        }
+
+    }
+}
+
+function jstor_faqs_sidebar_content(){
+  $cats = array('General Support', 'Video Tutorials','Webinars','Terminology','FAQs:Top Trending', 'Product Specific');
+  $mrkup = '<em>placeholder content</em><ul>';
+  foreach($cats as $c){
+    $mrkup .= '<li><h4>' . $c . '</h4></li>';
+  }
+  $mrkup .= '</ul>';
+  return $mrkup;
+}
+
+/*
+ * Created the front help and support page
+ */
+function _jstor_faq_landing_page(){
+
+    if( file_exists(drupal_realpath('public://') . '/helpsupport-landingpage.txt')){
+        $ret = file_get_contents(drupal_realpath('public://') . '/helpsupport-landingpage.txt');
+        if(!empty($ret)){
+            return $ret;
+        }
+    }
+
+
+  $nodes = node_load_multiple(array(), array('type' => 'faq_primary_category'));
+  
+  foreach($nodes as $n){
+    if($n->field_show_on_landing_page['und'][0]['value'] != '1'){continue;}
+    if(trim($n->field_appear_on_landing_page['und'][0]['value']) != 'help_support'){continue;}
+    $choices[$n->field_weight['und'][0]['value']] = array(
+      'image_url' => '/sites/default/files/' . $n->field_image['und'][0]['filename'],
+      'nid' => $n->nid,
+      'title' => $n->title,
+      'link_to' =>   '/' .  drupal_get_path_alias($n->field_url['und'][0]['value']),
+    );
+  } 
+  ksort($choices);
+
+  $ret = '<div class="helpChoices">';
+  foreach($choices as $k => $v){
+    $ret .= sprintf('<div class="helpChoice"><a href="%s"><img src="%s"><strong>%s</strong></a></div>',
+        $v['link_to'],$v['image_url'],$v['title']);  
+  }
+  $ret .= '</div>';
+
+  $cached_help_pages = variable_get('cached_help_pages',array());
+  file_put_contents(drupal_realpath('public://') . '/helpsupport-landingpage.txt', $ret);
+  array_push($cached_help_pages, 'landingpage');
+  variable_set('cached_help_pages', array_unique($cached_help_pages));
+
+  return $ret;
+}
+
+function _jstor_faq_general_landing_page(){
+    #why text tile caching? it was the best load time by far
+    if( file_exists(drupal_realpath('public://') . '/helpsupport-general-landingpage.txt')){
+        $ret = file_get_contents(drupal_realpath('public://') . '/helpsupport-general-landingpage.txt');
+        if(!empty($ret)){
+            return $ret;
+        }
+    }
+    //TODO: Call in an external file or use HEREDOC - this JS string is too crazy
+  $js = "(function ($) {
+  $(function(){
+    $('.newsAlerts').click(function(){
+      var maskHeight = $(document).height();
+      var maskWidth = $(window).width();
+      $('#mask').css({'width':maskWidth+'px','height':maskHeight+'px','z-index':'99'});
+      $('#mask').show();
+      $('#formWrapper').show().center();
+      $('#formWrapper').css('left','0');
+    });
+    $('#formWrapper .formMid a.close').click(function(){
+    $('#formWrapper').hide();
+    $('#mask').hide();
+    });	
+  });	
+
+  $('.chzn-container').click(function(){
+
+
+  $(this).find('div.chzn-drop').addClass('cznFocus');
+
+  $('body:not(.chzn-drop)').click(function(){
+  if ($('.chzn-container').hasClass('chzn-container-active'))	{	
+  $(this).find('div.chzn-drop').addClass('cznFocus');		
+  } 
+  else {
+  $('.chzn-container').removeClass('cznFocus');
+
+  }
+  });
+  });    
+  })(jQuery);";
+  drupal_add_js($js, 'inline');
+
+  $nodes = node_load_multiple(array(), array('type' => 'faq_primary_category'));
+  
+  foreach($nodes as $n){
+    if($n->field_show_on_landing_page['und'][0]['value'] != '1'){continue;}
+    if(trim($n->field_appear_on_landing_page['und'][0]['value']) != 'general_faq'){continue;}
+    $choices[$n->field_weight['und'][0]['value']] = array(
+      'image_url' => '/sites/default/files/' . $n->field_image['und'][0]['filename'],
+      'hover_text' => $n->field_hover_text['und'][0]['value'],
+      'nid' => $n->nid,
+      'title' => $n->title,
+      'link_to' =>   '/' .  drupal_get_path_alias($n->field_url['und'][0]['value']),
+    );
+  }
+  ksort($choices);
+  
+  $ret = '<div><p>' . variable_get('faq_landing_page_welcome', '') . '</p></div>';
+  $ret .= '<div class="helpChoices faqChoices">';
+  foreach($choices as $k => $v){
+    $ret .= sprintf('<div class="helpChoice faqChoice"><a href="%s"><img src="%s"><strong>%s</strong></a></div>',
+        $v['link_to'],$v['image_url'],$v['title']);  
+  }
+  $ret .= '</div>'; 
+  $ret .= '<div id="formWrapper">
+	<div class="formTop"></div>
+	<div class="formMid">
+		<div class="overlayleftcont">
+			<h3 class="signuptext">Sign up</h3>
+   	    </div>
+		<a class="close" href="javascript:void(0)"></a>
+		<div class="overlayrightcont">';
+  $block_id = variable_get('enews_registration_form_node', '127928');
+  $block = module_invoke('webform', 'block_view', 'client-block-' . $block_id);
+  $ret .= render($block['content']);
+  $ret .= '</div>
+		<div class="clearer"></div>
+	</div>
+	<div class="formBotm"></div>
+  </div>';
+    $cached_help_pages = variable_get('cached_help_pages',array());
+    file_put_contents(drupal_realpath('public://') . '/helpsupport-general-landingpage.txt', $ret);
+    array_push($cached_help_pages, 'general-landingpage');
+    variable_set('cached_help_pages', array_unique($cached_help_pages));
+
+  return $ret;
+}
+

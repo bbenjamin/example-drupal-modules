@@ -1,0 +1,11 @@
+name = Society Discounts
+description = Configure JPASS society discounts
+core = 7.x
+package = JPASS
+version = "7.x-1.0"
+core = "7.x"
+project = "ITHAKA"
+configure = society-discounts
+
+files[] = society_discounts.install
+files[] = society_discounts.module

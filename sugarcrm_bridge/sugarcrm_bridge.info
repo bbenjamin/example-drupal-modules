@@ -1,0 +1,9 @@
+name = SugarCRM Bridge
+description = Variables for connecting sugarcrm to this site via spinegar library
+core = 7.x
+package = JSTOR
+version = "7.x-1.0"
+core = "7.x"
+dependencies[] = libraries
+files[] = sugarcrm_bridge.module
+files[] = sugarcrm_bridge.admin.inc

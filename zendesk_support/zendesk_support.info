@@ -1,0 +1,7 @@
+name = Zendesk Support
+description = Connect Forms To Zendesk
+core = 7.x
+package = JSTOR
+version = "7.x-1.0"
+core = "7.x"
+files[] = zendesk_support.module

@@ -1,0 +1,147 @@
+<?php 
+function society_discounts_schema(){
+	$schema['society_records'] = array(
+		'description' => 'A society and associated variables',
+		'fields' => array(
+			'id' => array(
+	            'description' => 'The primary identifier.',
+	            'type' => 'serial',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+	        'society_id' => array(
+	            'description' => 'Identifier and url param for society',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	'society_name' => array(
+	            'description' => 'Full name of society',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+        	'monthly_discount' => array(
+	            'description' => 'Monthly Discount',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+              'yearly_discount' => array(
+	            'description' => 'Yearly Discount',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),    
+                'active' => array(
+	            'description' => 'Is Discount Active',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	            'default'	=> 1,
+	        ),
+              'threshold' => array(
+	            'description' => 'Number of redemptions before triggering alert',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+                    'default'	=> 0,
+	        ),
+                 'threshold_disable' => array(
+	            'description' => 'Disable discount after exceeding threshold',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+                    'default'	=> 0,
+	        ),
+                'threshold_email' => array(
+	            'description' => 'Email this address if threshold exceeded',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+              'monthly_url' => array(
+	            'description' => 'Monthly URL Param',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+          'yearly_url' => array(
+	            'description' => 'Yearly URL Param',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+          'offercode' => array(
+	            'description' => 'Offer Code',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+          'copy' => array(
+	            'description' => 'Descriptive Copy',
+	            'type' => 'varchar',
+	            'length' => 4096,
+	            'not null' => TRUE,
+        	),
+          'expiration_date' => array(
+	            'description' => 'Expiration Date',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),
+          
+	    ),    
+	    'primary key' => array('id'),
+	);
+	$schema['society_redemptions'] = array(
+		'fields' => array(
+		    'id' => array(
+	            'description' => 'The primary identifier.',
+	            'type' => 'serial',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+	        'society' => array(
+	            'description' => 'The Society Discount Being Used',
+	            'type' => 'int',
+	            'unsigned' => TRUE,
+	            'not null' => TRUE,
+	        ),
+        	'timestamp' => array(
+	            'description' => 'Time discount was redeemed',
+	            'type' => 'varchar',
+	            'length' => 255,
+	            'not null' => TRUE,
+        	),        	         		        
+	    ),    
+	    'primary key' => array('id'),
+	);
+	return $schema;	
+}
+/*
+function society_discounts_update_7001(){
+    db_add_field(
+      'society_records', 
+      'match_code', 
+    array(
+      'type' => 'varchar', 
+      'length' => 255, 
+      'not null' =>TRUE, 
+    )
+  );
+}
+*/
+function society_discounts_update_7002(){
+    db_add_field(
+      'society_records', 
+      'participant_type', 
+    array(
+      'type' => 'varchar', 
+      'length' => 255, 
+      'not null' => TRUE, 
+      'description' => 'Participant Type',
+      'default' => '_',
+    )
+  );
+}

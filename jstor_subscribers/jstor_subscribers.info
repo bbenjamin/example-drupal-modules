@@ -1,0 +1,7 @@
+name = JSTOR Subscribers
+description =  Pulls in a 10,000+ subscriber list once per day using Queue API and renders + caches an html table that can be filtered with JS
+package = JSTOR
+version = "7.x-1.0"
+core = "7.x"
+dependencies[] = libraries
+dependencies[] = sugarcrm_bridge

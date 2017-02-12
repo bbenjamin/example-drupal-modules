@@ -1,0 +1,33 @@
+<?php
+/**
+ * Implements hook_block_info().
+ */
+function jstor_international_links_block_info() {
+    $blocks = array();
+    $blocks['international_links'] = array(
+        'info' => t('International Site Links'),
+        'cache' => DRUPAL_NO_CACHE,
+    );
+    return $blocks;
+}
+/**
+ * Implements hook_block_view().
+ */
+function jstor_international_links_block_view($delta = '') {
+    $block = array();
+    switch ($delta) {
+        case 'international_links':
+            $block['subject'] = '';
+            $block['content'] = _jstor_international_links_CONTENT();
+            break;
+    }
+    return $block;
+}
+function _jstor_international_links_CONTENT() {
+    $path = current_path();
+    $path_alias = drupal_lookup_path('alias',$path);
+    $output = sprintf('<ul class="intlSites"><li>%s</li><li>%s</li></ul>',
+        l('Español', 'http://es.about.jstor.org/' . $path_alias),
+        l('Deutsch', 'http://de.about.jstor.org/' . $path_alias ));
+    return $output;
+}

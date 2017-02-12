@@ -1,0 +1,1255 @@
+<?php
+/**
+ *  Implements hook_menu()
+ */
+function data_to_node_menu() {
+    $items['acimport'] = array(
+        'page callback' => '_data_to_node_request',
+        'access callback' => 'user_is_logged_in',
+        'title'=> 'ac feed check '
+    );
+    $items['content-importer'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('data_to_node_form'),
+        'title'=> t('Create content importers'),
+    );
+    $items['edit-importer'] = array(
+        'page callback' => 'drupal_get_form',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array('data_to_node_instance_form',1),
+        'title'=> t('Edit Importer'),
+    );
+    $items['delete-importer'] = array(
+        'page callback' => 'data_to_node_delete_importer',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array(1),
+        'title'=> t('Delete Importer'),
+    );
+    $items['run-importer'] = array(
+        'page callback' => 'data_to_node_run_importer',
+        'access callback' => 'user_is_logged_in',
+        'page arguments' => array(1,2),
+        'title'=> t('Run Importer'),
+    );
+    return $items;
+}
+
+function remove_emoji($text){
+    return preg_replace('/([0-9|#][\x{20E3}])|[\x{00ae}|\x{00a9}|\x{203C}|\x{2047}|\x{2048}|\x{2049}|\x{3030}|\x{303D}|\x{2139}|\x{2122}|\x{3297}|\x{3299}][\x{FE00}-\x{FEFF}]?|[\x{2190}-\x{21FF}][\x{FE00}-\x{FEFF}]?|[\x{2300}-\x{23FF}][\x{FE00}-\x{FEFF}]?|[\x{2460}-\x{24FF}][\x{FE00}-\x{FEFF}]?|[\x{25A0}-\x{25FF}][\x{FE00}-\x{FEFF}]?|[\x{2600}-\x{27BF}][\x{FE00}-\x{FEFF}]?|[\x{2900}-\x{297F}][\x{FE00}-\x{FEFF}]?|[\x{2B00}-\x{2BF0}][\x{FE00}-\x{FEFF}]?|[\x{1F000}-\x{1F6FF}][\x{FE00}-\x{FEFF}]?/u', '', $text);
+}
+
+/**
+ *  Implements hook_cron()
+ */
+function data_to_node_cron(){
+    variable_set('importer_last_run', time());
+    $dbresult = data_to_node_get_active();
+    foreach($dbresult as $r){
+        data_to_node_run_importer($r->id, 'next', 'cron');
+    }
+
+    return;
+}
+/**
+ * Triggers a data importer to perform an import
+ *
+ * @param int $id
+ * 		The id of the importer being acted on
+ * @param $part
+ * 		If set to "next", will perform import on next scheduled subset of data
+ * 		If set to anything else, an import will be performed on full dataset
+ */
+
+function data_to_node_run_importer($id,$part,$cron=null){
+
+    $matchfields = array();
+    $nodecheck = array();  //This will be a series of subarrays where node field => value to be written to that node field
+    $dbget = db_query("SELECT * FROM  content_importers WHERE id = '{$id}'");
+    $dbresult = $dbget->fetchAll();
+    $fldget = db_query("SELECT * FROM  content_importers_field_mapping WHERE importer_machine_name = '{$dbresult[0]->machine_name}'");
+    $fldresult = $fldget->fetchAll();
+
+    foreach($fldresult as $f){
+        $matchfields[$f->importer_field] = $f->importer_destination;
+    }
+    //Check if url or file as source-- still need to add functionality if file is coming from file stored on server.
+    if($dbresult[0]->file_or_url == 'url'){
+        $data = drupal_http_request($dbresult[0]->path);
+    }
+    if($dbresult[0]->file_or_url == 'file'){
+        global $base_url;
+        $fil = file_load($dbresult[0]->path);
+
+        $fname =  "public://" . $fil->filename;
+
+        $dummp = file_get_contents($fname);
+
+        if($dummp !== false){
+            $data = new stdClass();
+            $data->data = $dummp;
+        }else{
+            watchdog("importer","could not load file " . $fil->filename);
+            return;
+        }
+    }
+    $enc = mb_check_encoding($data->data);
+    //The two condition statements below do essentially the same thing, which differences based on their delimiters
+    //The datasource is parsed into an array where each element contains a subarray of
+    //field names => value from external data
+    //this is then sent to the node processor for data updating
+    if($dbresult[0]->data_format == 'csv' || $dbresult[0]->data_format == 'tab'){
+        $fields = array();
+        $params['delimiter'] = $dbresult[0]->data_format;
+        $result = process_delimiter_result($data->data, $params, $fields);
+        //if running a subset, slice here
+        if($part == 'next'){
+            $setsize = count($result) / $dbresult[0]->num_subsets;
+            $result = array_slice($result,$setsize * $dbresult[0]->last_subset_checked ,$setsize);
+        }
+        foreach($result as $key => $value){
+            $onenode = array();
+            if($dbresult[0]->data_format  == 'csv'){
+                //$values = explode(",",$value);
+                $values = str_getcsv($value);
+            }
+            if($dbresult[0]->data_format  == 'tab'){
+                $values = explode("\t",$value);
+            }
+            $nodeprep = array();
+            foreach($values as $k => $v){
+                $nodeprep[$fields[$k]] = $v;
+            }
+            foreach($matchfields as $field => $loc){
+                $onenode[$loc] = $nodeprep[$field];
+            }
+            if(!isset($onenode['title'])){
+                watchdog('no title import', '<pre>' . print_r($value,1) .'</pre><pre>'. print_r($values,1) .'</pre><pre>'. print_r($fields,1) .'</pre><pre>'. print_r($matchfields,1) .'</pre>');
+            }
+            array_push($nodecheck, $onenode);
+        }
+    }
+    if($dbresult[0]->data_format == 'xml'){
+        $xml = new SimpleXMLElement($data->data);
+        $result = $xml->xpath($dbresult[0]->xpath);
+
+        //if running a subset, slice here
+        if($part == 'next'){
+            $setsize = count($result) / $dbresult[0]->num_subsets;
+            $result = array_slice($result,$setsize * $dbresult[0]->last_subset_checked ,$setsize);
+        }
+        foreach($result as $key => $value){
+            $onenode = array();
+            foreach($matchfields as $xpth => $field){
+                if(substr($xpth,0,1)=='@'){
+                    $xpth = substr($xpth,1);
+                    $str = (string)$value->attributes()->$xpth;
+                }else{
+                    $str = (string)$value->$xpth;
+                }
+                $onenode[$field] = $str;
+            }
+
+            array_push($nodecheck, $onenode);
+        }
+    }
+    $params['content_type'] = $dbresult[0]->node_type;  //params must include content type for the process_nodes function to work
+    archival_collection_process_nodes($nodecheck,$params);  //send arrays full of potential nodes to be written/updated
+
+    //if this is running a subset of the full data, update db to step past the subset just processed
+    if($part == 'next'){
+        if($dbresult[0]->last_subset_checked  >= $dbresult[0]->num_subsets -1){
+            $subset = 0;
+        }else{
+            $subset = $dbresult[0]->last_subset_checked + 1;
+        }
+        db_query("UPDATE {content_importers} set last_subset_checked='{$subset}' WHERE id = '{$id}'");
+    }
+    if(is_null($cron)){
+        drupal_set_message("importer successfully run");
+        drupal_goto('content-importer');
+    }
+    return "Import complete";
+
+}
+
+/**
+ *  Deletes importer
+ * @param int $id
+ * 		the id of the importer to be deleted
+ */
+function data_to_node_delete_importer($id){
+    //query db to get machine name for this importer, so the field mapping fields to be deleted can be identified.
+    $dbget = db_query("SELECT machine_name FROM  content_importers WHERE id = '{$id}'");
+    $dbresult = $dbget->fetchAll();
+    $query = db_delete('content_importers')
+        ->condition('id',$id)
+        ->execute();
+    $query = db_delete('content_importers_field_mapping')
+        ->condition('importer_machine_name',$dbresult[0]->machine_name)
+        ->execute();
+    drupal_goto('content-importer');
+}
+
+/**
+ * Gets a full list of importers or just one based on machine name... changing paramto ID may
+ * allow this function to substitute code elsewhere -- the machine_name param currently isn't used anywhere
+ */
+
+function data_to_node_get_active($machine_name = null){
+    if($machine_name == null){
+        $dbget = db_query("SELECT * FROM  content_importers");
+    }else{
+        $dbget = db_query("SELECT * FROM  content_importers WHERE machine_name = '{$machine_name}'");
+    }
+    $dbresult = $dbget->fetchAll();
+    return $dbresult;
+}
+
+/**
+ * Creates an html table with run/edit/delete options for an importer
+ * @param dbResultObject $result
+ * 	   a data object containing the values for one importer
+ */
+function data_to_node_list_html($result){
+    $options['attributes']['class'][] = 'importerrun';
+    $markup = "<br/><h2> $result->name </h2>";
+    $markup .= '<ul style="display:inline;list-style-type:none">';
+    $markup .= '<li style="display:inline;border-right:1px solid black;">'. l("  Run Next Iteration  ", "run-importer/" . $result->id ."/next", $options) . ' </li>';
+    $markup .= '<li style="display:inline;border-right:1px solid black;">&nbsp;  '. l("  Run Entire Dataset  ", "run-importer/" . $result->id . "/all", $options ) . ' </li>';
+    $markup .= '<li style="display:inline;border-right:1px solid black;">&nbsp;  '. l("  Edit  ", "edit-importer/" . $result->id) . ' </li>';
+    $markup .= '<li style="display:inline;border-right:1px solid black;">&nbsp;  '. l("  Delete  ", "delete-importer/" . $result->id) . ' </li>';
+    $markup .= "</ul><br/>";
+    return $markup;
+}
+/**
+ * Implements hook_form_submit(
+ * This is the submission actions when an existing importer is edited.
+ */
+
+function data_to_node_instance_form_submit($form, &$form_state){
+    if(isset($form_state['values']['file_update'])){
+        $path = $form_state['values']['file_update'];
+    }
+    if(isset($form_state['values']['path'])){
+        $path = $form_state['values']['path'];
+    }
+    $subsets = $form_state['values']['subsets'];
+
+
+
+    $id = $form_state['build_info']['args'][1];
+    $mn = $form_state['storage']['dbresult'][0]->machine_name;
+    $name = $form_state['storage']['dbresult'][0]->name;
+
+    $importer = db_query("SELECT * FROM  content_importers WHERE id = '{$id}'");
+    $iresult = $importer->fetchAll();
+    if($iresult->path != $path || $iresult->num_subsets != $subsets){
+        if(!empty($path)){
+            db_query("UPDATE content_importers SET path=:path, num_subsets=:subsets,last_subset_checked=:last WHERE id = :id",
+                array(':path' => $path, ':subsets' => $subsets, ':last' => 1, ':id'=>$id));
+        }
+
+    }
+    //db_query("UPDATE ")
+    $fldget = db_query("SELECT * FROM  content_importers_field_mapping WHERE importer_machine_name = '{$mn}'");
+    $fldresult = $fldget->fetchAll();
+    $just_fields = array_filter( $form_state['complete form']['mapping'],'data_to_node_list_form_fields');
+    $just_fields = array_filter( $just_fields,'data_to_node_just_node_fields');
+
+
+    //removes all current mapping, replaces with the new values
+    $del = db_delete('content_importers_field_mapping')
+        ->condition('importer_machine_name', $mn)
+        ->execute();
+
+    foreach($just_fields as $key => $value){
+        if($value['#value'] == 'select' || $value['#value'] == 'none'){
+            continue;
+        }
+
+        db_query("insert into content_importers_field_mapping (name,importer_machine_name, importer_field,importer_destination)
+					VALUES (:name, :machine_name, :field, :destination)",
+            array(':name' => $name, ':machine_name' => $mn, ':field' => $value['#value'], ':destination' => $key ));
+    }
+    drupal_set_message("importer edited");
+    drupal_goto('content-importer');
+}
+
+/**
+ * Implements form api
+ * This is a form that allows editing of an existing importer
+ */
+
+function data_to_node_instance_form($form, &$form_state){
+    //get all the relevant data about an importer, and make it editable with the form below
+
+    $id = $form_state['build_info']['args'][1];
+    $dbget = db_query("SELECT * FROM  content_importers WHERE id = '{$id}'");
+    $dbresult = $dbget->fetchAll();
+    $fldget = db_query("SELECT * FROM  content_importers_field_mapping WHERE importer_machine_name = '{$dbresult[0]->machine_name}'");
+    $fldresult = $fldget->fetchAll();
+    $form['id'] = array(
+        '#value' => $id,
+        '#type' => 'hidden',
+    );
+    $form['importername'] = array(
+        '#title' => 'Importer Name',
+        '#default_value' => $dbresult[0]->name,
+        '#type' => 'textfield',
+    );
+    if($dbresult[0]->file_or_url == 'url'){
+        $form['path'] = array(
+            '#title' => 'Path',
+            '#default_value' => $dbresult[0]->path,
+            '#type' => 'textfield',
+            '#size' => 100,
+        );
+    }
+    if($dbresult[0]->file_or_url == 'file'){
+        $file = file_load($dbresult[0]->path);
+        $form['file_update'] = array(
+            '#type' => 'managed_file',
+            '#title' => 'Change file',
+            '#size' => 48,
+            "#upload_validators"  => array("file_validate_extensions" => array(0 => 'csv'),
+                'file_validate_size' => array(32*1024*1024),
+            ),
+            "#description" => "This would replace the current file: " . $file->filename,
+            '#upload_location' => 'public://'
+        );
+    }
+    $form['subsets'] = array(
+        '#title' => 'Number of Subsets',
+        '#default_value' => $dbresult[0]->num_subsets,
+        '#type' => 'textfield',
+        '#size' => 6,
+    );
+    if($dbresult[0]->data_format == 'xml'){
+        $form['xpath'] = array(
+            '#title' => 'XPath Root',
+            '#default_value' => $dbresult[0]->xpath,
+            '#type' => 'textfield',
+            '#size' => 100,
+        );
+        $form['mapping'] = array(
+            '#type' => 'fieldset',
+            '#title' => t('Field Mapping'),
+            '#collapsible' => FALSE,
+        );
+        foreach($fldresult as $f){
+            $form['mapping'][$f->importer_destination] = array(
+                '#type' => 'textfield',
+                '#title' => $f->importer_destination,
+                '#default_value' => $f->importer_field
+            );
+        }
+        unset($form['mapping']['select']);
+    }
+    if($dbresult[0]->data_format == 'csv' || $dbresult[0]->data_format == 'tab'){
+        $content_fields = field_info_instances("node", $dbresult[0]->node_type);
+        $match_fields = array();
+        if(substr($dbresult[0]->path,0,4) == 'http'){
+            $data = drupal_http_request($dbresult[0]->path);
+        }
+        if(isset($file)){
+            $fil = file_load($dbresult[0]->path);
+            $fname = "http://localhost/sites/default/files/" . $fil->filename;
+            $data = drupal_http_request($fname);
+        }
+        $result = explode("\n",$data->data);
+        if(count($result) < 2){
+            $result = explode("\r",$data->data);
+        }
+        if($dbresult[0]->data_format == 'csv'){
+            $fields = str_getcsv($result[0]);
+        }
+        if($dbresult[0]->data_format == 'tab'){
+            $fields = explode("\t",$result[0]);
+        }
+        trim_keys_and_values($fields);
+        $fields = array_combine($fields, $fields);
+        $fields['select'] = 'select';
+        foreach($fldresult as $f){
+            $match_fields[$f->importer_destination] = $f->importer_field;
+        }
+        $cf = array();
+        $content_fields['select'] = 'select';
+        $form['mapping'] = array(
+            '#type' => 'fieldset',
+            '#title' => t('Field Mapping'),
+            '#collapsible' => FALSE,
+        );
+        $form['mapping']['title'] = array(
+            '#type' => 'select',
+            '#title' => 'Title',
+            '#options' => $fields,
+            '#default_value' => $match_fields['title'],
+            '#required' => true,
+        );
+        foreach($content_fields as $k => $v){
+            if(isset($match_fields[$k])){
+                $form['mapping'][$k] = array(
+                    '#type' => 'select',
+                    '#title' => $v['label'],
+                    '#options' => $fields,
+                    '#default_value' => $match_fields[$k]
+                );
+            }else{
+                $form['mapping'][$k] = array(
+                    '#type' => 'select',
+                    '#title' => $v['label'],
+                    '#options' => $fields,
+                    '#default_value' => 'select'
+                );
+            }
+        }
+        unset($form['mapping']['select']);
+    }
+    $form['submit'] = array(
+        '#type' => 'submit',
+        '#value' => 'Submit Changes',
+    );
+    $form_state['storage']['dbresult'] = $dbresult; //gives submitter full access to db result data
+    return $form;
+}
+
+/**
+ * Implements hook_form()
+ * This is the muptistep form where a new importer is created
+ */
+function data_to_node_form($form, &$form_state){
+
+    //if no form step is present, build new form -- else it renders form for
+    //the given step in the multistage sequence
+
+    if(!isset($form_state['values']['step'])){
+        $format_options = array('xml'=>'XML','csv'=>'CSV','tab' =>'Tab');
+        $source_options = array('url' => 'URL', 'upload' => 'File Upload');
+        $node_types = node_type_get_names();
+        $node_types['select'] = 'select';
+        $form['existing'] = array(
+            '#type' => 'fieldset',
+            '#title' => t('Existing Importers'),
+            '#collapsible' => FALSE,
+            '#access'=> false
+        );
+        $form['one'] = array(
+            '#type' => 'fieldset',
+            '#title' => t('Create New Importer'),
+            '#collapsible' => FALSE,
+        );
+        $result = data_to_node_get_active();
+        if(!empty($result)){
+            $markup = "";
+            $form['existing']['#access'] = true;
+            foreach($result as $r){
+                $markup .= data_to_node_list_html($r);
+            }
+            $form['existing']['exists'] = array(
+                '#markup' => $markup,
+            );
+        }
+        $form['one']['importer_name'] = array(
+            '#type' => 'textfield',
+            '#title' => 'Name This Importer',
+            '#required' => true,
+        );
+        $form['one']['content_type'] = array(
+            '#type' => 'select',
+            '#title' => 'Choose the content type being imported to',
+            '#options' => $node_types,
+            '#default_value' => 'select',
+        );
+        $form['one']['format'] = array(
+            '#type' => 'radios',
+            '#title' => t('Input Format'),
+            '#options' => $format_options,
+            '#states' => array(
+                'invisible' => array(':input[name="content_type"]' => array('value' => 'select')),
+            ),
+            '#description' =>   "Note: CSV files saved from Excel must be MS-DOS format, NOT Windows format.",
+        );
+        $form['one']['source'] = array(
+            '#type' => 'radios',
+            '#title' => t('Data Source'),
+            '#options' => $source_options,
+            '#states' => array(
+                'visible' => array(':input[name="format"]' => array(
+                    array('value' => 'xml'),
+                    array('value' => 'csv'),
+                    array('value' => 'tab')),
+                )
+            ),
+        );
+        $form['one']['url'] = array(
+            '#type' => 'textfield',
+            '#title' => 'File URL',
+            '#states' => array(
+                'visible' => array(':input[name="source"]' => array('value' => 'url')  ),
+            ),
+        );
+        $form['one']['file'] = array(
+            '#type' => 'file',
+            '#title' => 'Upload a local file',
+            '#size' => 48,
+            '#states' => array(
+                'visible' => array(':input[name="source"]' => array('value' => 'upload')  ),
+            ),
+            "#upload_validators"  => array("file_validate_extensions" => array(0 => 'csv'),
+                'file_validate_size' => array(32*1024*1024),
+            ),
+        );
+        $form['one']['submit_url'] = array(
+            '#type' => 'submit',
+            '#value' => 'Get Remote Data',
+            '#states' => array(
+                'visible' => array(':input[name="source"]' => array('value' => 'url')  ),
+            ),
+        );
+        $form['one']['submit_file'] = array(
+            '#type' => 'submit',
+            '#value' => 'Import File',
+            '#states' => array(
+                'visible' => array(':input[name="source"]' => array('value' => 'upload')  ),
+            ),
+        );
+        $form['step'] = array(
+            '#type' => 'hidden',
+            '#value' => 1,
+        );
+    }else{
+        //make modifications to form the new form altogether, but reset the validator so it runs for additional steps
+        //watchdog('importer', 'step ' .$form['step']['#value']);
+        $form = $form_state['storage']['frm'];
+        $form['#validated'] = false;
+
+        //these lines are to address a bug that causes the form to crash
+        //due to contents of form['two'] being around during stage four of the process
+        /// THIS IS HACKY!
+        if(isset($form['four'])){
+            $form_state['storage']['two'] = $form['two'];
+
+            if(isset($form['two'])){
+                $form_state['storage']['values'] = $form_state['values'];
+                unset($form['two']);}
+        }
+    }
+    return $form;
+}
+function data_to_node_instance_form_validate($form, &$form_state){
+    $validators = array('file_validate_extensions' => array('csv txt xml'));
+}
+
+function data_to_node_form_validate($form, &$form_state){
+    $step = $form_state['values']['step'];
+    $format = $form_state['values']['format'];
+    if($step == 1){
+        if($form_state['values']['op'] == 'Import File'){
+            $validators = array('file_validate_extensions' => array('csv txt xml'));
+        }
+    }
+    if($step == 2){
+        if($format == 'xml'){
+            $matchfields = array_filter($form_state['complete form']['two']['match'], 'data_to_node_list_form_fields');
+            $xml = new SimpleXMLElement($form_state['storage']['data']);
+            $result = $xml->xpath($form_state['values']['xpath']);
+            if(empty($result)){
+                form_set_error('xpath', t('The XPath root provides zero results'));
+            }
+        }
+    }
+}
+function data_to_node_file_validate($file){
+    if(strpos($file->filename, ' ') >= 1){
+        $errors[] = t("The uploaded filename must not have spaces. Click 'back', Rename and try again.");
+        return $errors;
+    }
+}
+
+/**
+ * Implements hook_form_submit
+ * handles data differently depending on what stage the form is in,
+ * type of data and source of data.
+ */
+function data_to_node_form_submit($form, &$form_state){
+    $step = $form_state['values']['step'];
+    $format = $form_state['values']['format'];
+    $params = array('content_fields' => field_info_instances("node", $form_state['values']['content_type']),
+        'step'	=> $step);
+
+    if($step == 1){
+        $form['two'] = array(
+            '#type' => 'fieldset',
+            '#title' => t('Match Fields'),
+            '#collapsible' => FALSE,
+        );
+        $form['step']['#value'] = 2;
+        $form_state['values']['step'] = 2;
+        $form['one']['#access'] = false;
+        $form['existing']['#access'] = false;
+        if($form_state['values']['op'] == 'Import File'){
+            $uploaded = file_save_upload('file', array('file_validate_extensions' => array('csv txt xml')),'public://',FILE_EXISTS_REPLACE);
+            $uploaded->status = 1;
+            file_save($uploaded);
+            $data = file_get_contents($uploaded->uri);
+            $params['file_uri'] = $uploaded->uri;
+            $form_state['storage']['file_uri'] = $uploaded->fid;
+        }
+        if($form_state['values']['op'] == 'Get Remote Data'){
+            $result = drupal_http_request($form_state['values']['url']);
+            $data = $result->data;
+        }
+        $form_state['storage']['data'] = $data;
+        switch($format){
+            case "xml":
+                data_to_node_xml_one($form, $form_state, $data, $params);
+                break;
+            case "csv":
+                $params['delimiter'] = 'csv';
+                data_to_node_txt_one($form, $form_state, $data, $params);
+                break;
+            case "tab":
+                $params['delimiter'] = 'tab';
+                data_to_node_txt_one($form, $form_state, $data, $params);
+                break;
+        }
+    }
+    if($step == 2){
+
+        $form['step']['#value'] = 3;
+        $form_state['values']['step'] = 3;
+        data_to_node_two($form, $form_state, $form_state['storage']['data'] , $params);
+    }
+    if($step == 3){
+        $form['step']['#value'] = 4;
+        $form_state['values']['step'] = 4;
+        switch($format){
+            case "xml":
+                data_to_node_xml_three($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+            case "csv":
+                $params['delimiter'] = 'csv';
+                data_to_node_txt_three($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+            case "tab":
+                $params['delimiter'] = "tab";
+                data_to_node_txt_three($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+        }
+    }
+    if($step == 4){
+        $form['step']['#value'] = 5;
+        $form_state['values']['step'] = 5;
+        switch($format){
+            case "xml":
+                data_to_node_xml_four($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+            case "csv":
+                $params['delimiter'] = 'csv';
+                data_to_node_txt_four($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+            case "tab":
+                $params['delimiter'] = 'tab';
+                data_to_node_txt_four($form, $form_state, $form_state['storage']['data'] , $params);
+                break;
+        }
+    }
+    $form_state['rebuild'] = true;
+}
+
+/**
+ * Stage 1 of txt based (CSV or TAB) importer creation
+ */
+
+function data_to_node_txt_one($form, &$form_state, $data, $params){
+    $contentselect['title'] = 'Title';
+    $lines = explode("\n",$data);
+    if(count($lines) < 2){
+        $lines = explode("\r",$data);
+    }
+    if($params['delimiter'] == 'csv'){
+        $fields = str_getcsv($lines[0]);
+    }
+    if($params['delimiter'] == 'tab'){
+        $fields = explode("\t",$lines[0]);
+    }
+    $fields['select'] = 'select';
+    $form['two']['match'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Associate Fields'),
+        '#collapsible' => FALSE,
+        '#weight' => 4,
+    );
+    $form['two']['match']['title'] = array(
+        '#type' => 'select',
+        '#title'=> 'Title',
+        '#required' => true,
+        '#options'	=> $fields,
+        '#default_value' => 'select',
+    );
+    foreach($params['content_fields'] as $key => $value){
+        $contentselect[$key] = $value['label'];
+        $form['two']['match'][$key] = array(
+            '#type' => 'select',
+            '#title'=> 'Field Name: ' . $value['label'],
+            '#options'	=> $fields,
+            '#default_value' => 'select',
+        );
+    }
+    $form['two']['submit_file'] = array(
+        '#type' => 'submit',
+        '#value' => 'Map Fields',
+        '#weight' => 12
+    );
+    $form['#validate'][] = 'data_to_node_xml_one_validate';
+    $form_state['storage']['frm'] = $form;
+}
+
+/*
+ * This validator just exists for debugging
+ */
+function data_to_node_xml_one_validate($form, &$form_state){
+//	$step = $form_state['values']['step'];
+//	$format = $form_state['values']['format'];
+//dsm('Steeeep ' . $step);
+    //dsm($form_state);
+}
+
+/**
+ * Stage 1 of XML importer creation
+ */
+function data_to_node_xml_one($form, &$form_state, $data, $params){
+    $contentselect['title'] = 'Title';
+    $form['two']['xpath'] = array(
+        '#type' => 'textfield',
+        '#title' => 'Xpath Root',
+        '#size' => 120,
+        '#required' => TRUE,
+    );
+    $form['two']['match'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Associate fields to Xpath'),
+        '#collapsible' => FALSE,
+        '#weight' => 4,
+    );
+    $form['two']['match']['title'] = array(
+        '#type' => 'textfield',
+        '#title'=> 'Title',
+        '#required' => true,
+    );
+    foreach($params['content_fields'] as $key => $value){
+        $contentselect[$key] = $value['label'];
+        $form['two']['match'][$key] = array(
+            '#type' => 'textfield',
+            '#title'=> 'Field Name: ' . $value['label']
+        );
+    }
+    $form['two']['submit_file'] = array(
+        '#type' => 'submit',
+        '#value' => 'Map Fields',
+        '#weight' => 12
+    );
+
+    $form_state['storage']['frm'] = $form;
+}
+
+
+/**
+ * Stage 2 of importer creation -- format agnostic as it
+ * just shows number of records and asks if user wants to use subsets
+ */
+
+function data_to_node_two($form, &$form_state, $data, $params){
+    $format = $form_state['values']['format'];
+    if($format == 'xml'){
+        $xml = $xml = new SimpleXMLElement($data);
+        $result = $xml->xpath($form_state['values']['xpath']);
+    }
+    if($format == 'csv' || $format == 'tab'){
+        $result = explode("\n",$data);
+        if(count($result) < 2){
+            $result = explode("\r",$data);
+        }
+    }
+    $count = count($result);
+    $form['two']['#access'] = false;
+    $form['three'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Chunk Return Data'),
+        '#collapsible' => FALSE,
+        '#weight' => 1,
+    );
+    $form['three']['subsets'] = array(
+        '#type' => 'textfield',
+        '#title' => 'Number of subsets',
+        '#description' => 'This dataset has ' . $count . ' records. Enter the number of subets you wish to divide the record into so fewer entries are processed per cron.
+		  													Or, leave blank to process the whole dataset',
+        '#size' => 12,
+    );
+    $form['three']['submit_chunk'] = array(
+        '#type' => 'submit',
+        '#value' => 'Select Chunk',
+        '#weight' => 14
+    );
+    $form_state['storage']['frm'] = $form;
+}
+/**
+ * Stage 3 of txt based (CSV or TAB) importer creation
+ */
+function data_to_node_txt_three($form, &$form_state, $data, $params){
+    $matchfields = array_filter($form_state['complete form']['two']['match'], 'data_to_node_list_form_fields');
+    foreach($matchfields as $key => $value){
+        if(!empty($form_state['values'][$key]) && $form_state['values'][$key] != 'select'){
+            $matchfields[$key] = $form_state['values'][$key];
+        }else{
+            unset($matchfields[$key]);
+        }
+        if($key == 'title'){
+            $matchfields[$key] = $form_state['values']['title'];
+        }
+    }
+    $fields = array();
+    $nodecheck = array();
+    $result = process_delimiter_result($data, $params, $fields);
+    unset($result[0]);
+    $result = array_slice($result,0,10);
+    foreach($result as $key => $value){
+        $onenode = array();
+        if($params['delimiter'] == 'csv'){
+            //$values = explode(",",$value);
+            $values = str_getcsv($value);
+        }
+        if($params['delimiter'] == 'tab'){
+            $values = explode("\t",$value);
+        }
+        foreach($matchfields as $field => $loc){
+            if(!empty($values[$loc])){
+                $onenode[$field] = $values[$loc];
+            }
+        }
+
+    }
+    $params['content_type'] = $form_state['values']['content_type'];
+    $markup = data_to_node_verify_mapping($form_state, $nodecheck,$params);
+    data_to_node_end_step_three($form, $markup);
+    $form_state['storage']['frm'] = $form;
+}
+
+/**
+ * Stage 3 of xml based importer creation
+ */
+function data_to_node_xml_three($form, &$form_state, $data, $params){
+    $xml = new SimpleXMLElement($data);
+    $matchfields = array_filter($form_state['complete form']['two']['match'], 'data_to_node_list_form_fields');
+    foreach($matchfields as $key => $value){
+        if(!empty($form_state['values'][$key])){
+            $matchfields[$key] = $form_state['values'][$key];
+        }else{
+            unset($matchfields[$key]);
+        }
+    }
+    $matchfields['title'] = $form_state['values']['title'];
+    $xroot = array_fill(0,count($matchfields), $form_state['values']['xpath']);
+    $nodecheck = array();
+    $result = $xml->xpath($form_state['values']['xpath']);
+    $result = array_slice($result,0,10);
+    foreach($result as $key => $value){
+        $onenode = array();
+        foreach($matchfields as $field => $xpth){
+            if(substr($xpth,0,1)=='@'){
+                $xpth = substr($xpth,1);
+                $str = (string)$value->attributes()->$xpth;
+            }else{
+                $str = (string)$value->$xpth;
+            }
+            $onenode[$field] = $str;
+        }
+        array_push($nodecheck, $onenode);
+    }
+    $params['content_type'] = $form_state['values']['content_type'];
+    $markup = data_to_node_verify_mapping($form_state, $nodecheck,$params);
+    data_to_node_end_step_three($form, $markup);
+    $form_state['storage']['frm'] = $form;
+}
+
+/**
+ * Form elements that are applied at the end of stage 3, regardless of format
+ */
+function data_to_node_end_step_three(&$form, $markup){
+    $form['three']['#access'] = false;
+    $form['four'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('These are how the fields will be matched'),
+        '#collapsible' => FALSE,
+        '#weight' => 1,
+    );
+    $form['four']['examples'] = array(
+        '#markup' => $markup,
+        '#weight' => 10
+    );
+    $form['four']['verify_map'] = array(
+        '#type' => 'submit',
+        '#value' => 'Use This Mapping',
+        '#weight' => 14
+    );
+}
+
+/**
+ * Stage 4 of txt based (CSV or TAB) importer creation
+ */
+function data_to_node_txt_four($form, &$form_state, $data, $params){
+    $form['four']['#access'] = false;
+    $matchfieldsMake = $form_state['storage']['two']['match'];
+    $matchfields['title'] = "";
+    foreach($matchfieldsMake as $key => $value){
+        if(strpos($key, '#') != false){
+            continue;
+        }
+        if(!is_array($value)){
+            continue;
+        }
+        if(!empty($form_state['storage']['values'][$key]) && $form_state['storage']['values'][$key] != 'select'){
+            $matchfields[$key] = $form_state['storage']['values'][$key];
+        }else{
+            unset($matchfields[$key]);
+        }
+        if($key == 'title'){
+            $matchfields[$key] = $form_state['storage']['values']['title'];
+        }
+    }
+    if(!isset($matchfields['title'])){
+        $matchfields['title'] = 888;
+    }
+    $nodecheck = array();
+    $fields = array();
+    $result = process_delimiter_result($data, $params, $fields);
+    unset($result[0]);
+    if(isset($form_state['values']['subsets'])){
+        $setsize = count($result) / $form_state['values']['subsets'];
+    }else{
+        $setsize = count($result);
+    }
+    $result = array_slice($result,0,$setsize);
+    foreach($result as $key => $value){
+        $onenode = array();
+        if($params['delimiter'] == 'csv'){
+            //$values = explode(",",$value);
+            $values = str_getcsv($value);
+        }
+        if($params['delimiter'] == 'tab'){
+            $values = explode("\t",$value);
+        }
+        foreach($matchfields as $field => $loc){
+            if(!empty($values[$loc])){
+                $onenode[$field] = $values[$loc];
+            }
+        }
+        array_push($nodecheck, $onenode);
+    }
+    $params['content_type'] = $form_state['values']['content_type'];
+    $form['five'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Gonna get saved'),
+        '#collapsible' => FALSE,
+        '#weight' => 1,
+    );
+    $form['five']['verify_map'] = array(
+        '#type' => 'submit',
+        '#value' => 'Use This Mapping',
+        '#weight' => 14
+    );
+    $form_state['storage']['frm'] = $form;
+    data_to_node_write_db($form_state, $matchfields, $fields);
+}
+
+/**
+ * Stage 4 of xml based importer creation
+ */
+function data_to_node_xml_four($form, &$form_state, $data, $params){
+    $form['four']['#access'] = false;
+
+    $xml = new SimpleXMLElement($data);
+    $matchfields = array_filter($form_state['storage']['two']['match'], 'data_to_node_list_form_fields');
+    foreach($matchfields as $key => $value){
+        if(!empty($form_state['storage']['values'][$key]) && $form_state['storage']['values'][$key] != 'select'){
+            $matchfields[$key] = $form_state['storage']['values'][$key];
+        }else{
+            unset($matchfields[$key]);
+        }
+    }
+    $matchfields['title'] = $form_state['storage']['values']['title'];
+    $nodecheck = array();
+    $result = $xml->xpath($form_state['values']['xpath']);
+
+    if(isset($form_state['values']['subsets'])){
+        $setsize = count($result) / $form_state['values']['subsets'];
+    }else{
+        $setsize = count($result);
+    }
+    $result = array_slice($result,0,$setsize);
+
+    foreach($result as $key => $value){
+        $onenode = array();
+        foreach($matchfields as $field => $xpth){
+            if(substr($xpth,0,1)=='@'){
+                $xpth = substr($xpth,1);
+                $str = (string)$value->attributes()->$xpth;
+            }else{
+                $str = (string)$value->$xpth;
+            }
+            $onenode[$field] = $str;
+        }
+        array_push($nodecheck, $onenode);
+    }
+    $params['content_type'] = $form_state['values']['content_type'];
+    //archival_collection_process_nodes($nodecheck,$params);
+    $form['five'] = array(
+        '#type' => 'fieldset',
+        '#title' => t('Gonna get saved'),
+        '#collapsible' => FALSE,
+        '#weight' => 1,
+    );
+    $form['five']['verify_map'] = array(
+        '#type' => 'submit',
+        '#value' => 'Use This Mapping',
+        '#weight' => 14
+    );
+    $form_state['storage']['frm'] = $form;
+    data_to_node_write_db($form_state, $matchfields);
+}
+/**
+ * In stage 3 of importer creation, this creates a list of 10 sets of
+ * matched fields & values so user can verify import is directing the
+ * data to desired fields
+ */
+function data_to_node_verify_mapping($form_state, $nodecheck,$params){
+    $markup = "<h2>Field Matching Examples</h2><hr/>";
+    $ct = $params['content_type'];
+    foreach($nodecheck as $chk){
+        $res = db_query("SELECT nid from {node} WHERE title = '{$chk['title']}' and type = '{$ct}'");
+        $fres = $res->fetchAll();
+        if (!empty($fres)) {
+            $node = node_load($fres[0]->nid);
+        } else {
+            $node = new stdClass();
+            $node->type = $form_state['values']['content_type'];
+            $node->language = 'und';
+            $node->title = remove_emoji($chk['title']);
+        }
+        $markup .= '<br/><h2>' . $node->title . '</h2> (title) <ul>';
+        unset($chk['title']);
+        $save = false;
+        foreach($chk as $field => $value){
+            $markup .=  '<li>' . $field . ' ---> ' . $value .'</li>';
+        }
+    }
+    $markup .= '</ul>';
+    return $markup;
+}
+
+/**
+ * Creates or updates nodes based on imported data
+ * @param  array $nodecheck
+ * 			$nodecheck[] = $key(node field name) => $value=>(value from imported data to be written to field )
+ * @param array $params
+ * 				currently requires key ['content_types] to work, but used as an array to accomodate expansion
+ */
+
+function apostrophe_saver($str){
+    $str = str_replace("'", "''",$str);
+    return trim($str);
+}
+
+function archival_collection_process_nodes( $nodecheck,$params){
+    $ct = $params['content_type'];
+    foreach($nodecheck as $chk){
+        $dbtitle = apostrophe_saver($chk['title']);
+        $res = db_query("SELECT nid from {node} WHERE title = '{$dbtitle}' and type = '{$ct}'"); 	  	//##reduce array
+        $fres = $res->fetchAll();
+        $save = false;
+        //if it's an existing node -- update. If no title match -- create a new one
+        if (!empty($fres)) {
+            $node = node_load($fres[0]->nid);
+        } else {
+            $node = new stdClass();
+            $node->type = $ct;
+            $node->language = 'und';
+            $node->title = quotetrimmer(remove_emoji($chk['title']));
+            $save = true;
+        }
+        unset($chk['title']);
+
+        foreach($chk as $field => $value){
+            $value = quotetrimmer($value);
+            if(!isset($node->{$field}['und'][0]['value'] ) && !empty($value) || isset($node->{$field}['und'][0]['value'] ) && $node->{$field}['und'][0]['value'] != $value){
+                $node->{$field}['und'][0]['value'] = $value;
+                $save = true;
+            }
+        }
+        if($save){
+            try{
+                node_save($node); //## Add a try catch to this
+                if(!empty($node->title)){
+                    watchdog("importer","added/updated " . $node->title);
+                }else{
+                    watchdog("empty import", sprintf("<h4>CHK</h4><pre>%s</pre><h4>PARAMS</h4><pre>%s</pre>",print_r($chk,1),print_r($params,1)));
+                }
+
+            }catch(Exception $e){
+                watchdog("importer","problem saving " . $node->title . " " .$e->getMessage());
+            }
+
+        }
+    }
+}
+
+/**
+ * breaks flat data into an array of entires and creates an array of headers
+ * @return array $result
+ * 		array where each element represents a separate line of data being processed
+ * 		with the exception of the header
+ *
+ * @param string $data
+ * 		long string of csv or tab separated data
+ * @param array $params
+ *       the ['delimiter'] key is required for function to work
+ * @param array $fields -
+ * 	comes in empty and as a reference. function writes each header field to a new element.
+ */
+function process_delimiter_result($data, $params, &$fields){
+    $result = explode("\n",$data);
+    if(count($result) < 2){
+        $result = explode("\r",$data);
+    }
+
+    if($params['delimiter'] == 'csv'){
+        $fields = str_getcsv($result[0]);
+    }
+    if($params['delimiter'] == 'tab'){
+        $fields = explode("\t",$result[0]);
+    }
+    trim_keys_and_values($fields);
+    unset($result[0]);
+    return $result;
+}
+function trim_keys_and_values(&$fields){
+    $fields = array_flip($fields);
+    $fields = array_map('array_whitespace_remove', $fields);
+    $fields = array_flip($fields);
+    $fields = array_map('array_whitespace_remove', $fields);
+}
+
+function array_whitespace_remove($a){
+    return trim($a);
+}
+
+/**
+ * after an importer is created, store configuration in db
+ * @param array $matchfields
+ * 			key is the name of a node field
+ * 			value is either the  xpath query that corresponds to the node field or the column number of the csv/tab field the data is used for
+ * @param array $fields
+ * 			only needed for csv/tab imports -- is the name of the header fields that lines up with the column number in matchfields
+ */
+function data_to_node_write_db($form_state, $matchfields, $fields = null){
+    $name = $form_state['values']['importer_name'];
+    $machine_name = make_machine_name($name);
+    if(!empty($form_state['values']['url'])){
+        $file_or_url = 'url';
+        $path = $form_state['values']['url'];
+    }
+    if(!empty($form_state['storage']['file_uri'])){
+        $file_or_url = 'file';
+        $path =$form_state['storage']['file_uri'];
+    }
+    $subsets = $form_state['values']['subsets'];
+    if(empty($subsets)){$subsets = 1;}
+    $format = $form_state['values']['format'];
+    $node_type = $form_state['values']['content_type'];
+    if(isset($form_state['storage']['two']['xpath'])){
+        $xpath = $form_state['storage']['two']['xpath']['#value'];
+    }else{
+        $xpath = 'not xml';
+    }
+    $dbget = db_query("SELECT * FROM content_importers WHERE machine_name = '{$machine_name}'");
+    $dbresult = $dbget->fetchAll();
+    if(empty($dbresult)){
+        db_query("insert into content_importers (name,machine_name,file_or_url,path,num_subsets,last_subset_checked,data_format,node_type,xpath)
+									VALUES (:name,:machine_name,:file_or_url,:path, :num_subsets,:last_subset_checked,:data_format,:node_type,:xpath)",
+            array(':name' => $name ,':machine_name' => $machine_name,':file_or_url' => $file_or_url, ':path' => $path,
+                ':num_subsets' => $subsets, ':last_subset_checked'=>'1',':data_format'=>$format, ':node_type' => $node_type, ':xpath' => $xpath));
+        if($format == 'csv' || $format == 'tab'){
+            foreach($matchfields as $field =>$num){
+                db_query("insert into content_importers_field_mapping (name,importer_machine_name, importer_field,importer_destination)
+					VALUES (:name, :machine_name, :field, :destination)",
+                    array(':name' => $name, ':machine_name' => $machine_name, ':field' => trim($fields[$num]), ':destination' => trim($field), ));
+            }
+        }
+        if($format == 'xml' ){
+            foreach($matchfields as $field =>$xp){
+                db_query("insert into content_importers_field_mapping (name,importer_machine_name, importer_field,importer_destination)
+					VALUES (:name, :machine_name, :field, :destination)",
+                    array(':name' => $name, ':machine_name' => $machine_name, ':field' => $xp, ':destination' => $field, ));
+            }
+        }
+    }
+    drupal_set_message("new importer created");
+    drupal_goto('content-importer');
+}
+/**
+ * Takes incoming string parameter, replaces spaces and dashes with underscores and
+ * removes quotes and apostrophes
+ */
+
+function make_machine_name($str){
+    $s = str_replace(' ','_',$str);
+    $s = str_replace('-','_',$s);
+    $s = strtolower($s);
+    $s = str_replace('""','',$s);
+    $s = str_replace("'",'',$s);
+    return $s;
+}
+
+/**
+ * used with array_filter to strip out non-arrays and
+ * arrays used for attributes (keys begin with #)
+ */
+function data_to_node_list_form_fields($f){
+    if(is_array($f)){
+        if(key($f) == 'title' ){
+            return true;
+        }
+        if(substr(key($f),0,1) == '#'){
+            return true;
+        }else{
+            return false;
+        }
+    }
+}
+
+/**
+ * used with array_filter to return only elements within a form array
+ * that correspond to node fields. This skips both attribute elements
+ * and form fields that don't correspond to a node field
+ */
+function data_to_node_just_node_fields($f){
+    if(key($f) == 'title'){
+        return false;
+    }
+    if(is_array($f)){
+        if(substr(key($f),0,5) == 'field'){
+            return false;
+        }else{
+            return true;
+        }
+    }
+}
+
+function quotetrimmer($str){
+    if(substr($str,0,1)== '"' && substr($str,-1)== '"' || substr($str,0,1)== "'" && substr($str,-1)== "'"){
+        $str = substr($str,1);
+        $str = substr($str,0, strlen($str) - 1);
+    }
+    return $str;
+}

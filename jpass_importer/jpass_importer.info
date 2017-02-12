@@ -1,0 +1,7 @@
+name = Jpass Feed Importer
+description = Takes info from Literatum and writes it to nodes 
+core = 7.x
+package = JSTOR Importers
+version = "7.x-1.0"
+core = "7.x"
+project = "ITHAKA"

@@ -1,0 +1,10 @@
+name = Jstor Fees Helper
+description = Single page that uses views + ajax to provide org-specifc fees info
+core = 7.x
+package = JSTOR 
+dependencies[] = views_php
+dependencies[] = views
+version = "7.x-1.0"
+core = "7.x"
+project = "ITHAKA"
+
